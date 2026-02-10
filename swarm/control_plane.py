@@ -210,6 +210,12 @@ class V3Handler(BaseHTTPRequestHandler):
 
             paused = db.get_config('paused', 'false') == 'true'
 
+            # Compute dashboard-friendly fields
+            online_drones = [d for d in drones if d.get('online') or d.get('status') == 'online']
+            total_cores = sum(
+                (d.get('capabilities') or {}).get('cores', 0) for d in online_drones
+            )
+
             self.send_json({
                 'needed': counts['needed'],
                 'delegated': counts['delegated'],
@@ -217,6 +223,13 @@ class V3Handler(BaseHTTPRequestHandler):
                 'blocked': counts['blocked'],
                 'failed': counts['failed'],
                 'total': counts['total'],
+                # Dashboard-compatible aliases
+                'queue_depth': counts['needed'] + counts['delegated'],
+                'queue_received': counts['received'],
+                'queue_blocked': counts['blocked'],
+                'nodes': len(drones),
+                'nodes_online': len(online_drones),
+                'total_cores': total_cores,
                 'paused': paused,
                 'session': session,
                 'packages': {
