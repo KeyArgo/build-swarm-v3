@@ -52,6 +52,27 @@ SWEEPER_THRESHOLD = int(os.environ.get('SWEEPER_THRESHOLD', MAX_DRONE_FAILURES))
 STAGING_PATH = os.environ.get('STAGING_PATH', '/var/cache/binpkgs-v3-staging')
 BINHOST_PATH = os.environ.get('BINHOST_PATH', '/var/cache/binpkgs-v3')
 
+# Control plane URL — auto-discover if not set
+KNOWN_HOSTS = ['localhost', '10.0.0.199']
+
+def discover_control_plane(port=None):
+    """Find a running control plane. Checks localhost first, then known hosts."""
+    import urllib.request
+    port = port or CONTROL_PLANE_PORT
+    env_url = os.environ.get('SWARMV3_URL')
+    if env_url:
+        return env_url
+    for host in KNOWN_HOSTS:
+        url = f'http://{host}:{port}'
+        try:
+            req = urllib.request.Request(f'{url}/api/v1/health', method='GET')
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                if resp.status == 200:
+                    return url
+        except Exception:
+            continue
+    return f'http://localhost:{port}'
+
 # Protected hosts
 def _load_protected_hosts() -> set:
     hosts = set()

@@ -53,12 +53,21 @@ if not sys.stdout.isatty():
 # ── API Client ───────────────────────────────────────────────────────────────
 
 DEFAULT_URL = 'http://localhost:8100'
-BASE_URL = os.environ.get('SWARMV3_URL', DEFAULT_URL)
+BASE_URL = None  # Resolved lazily on first API call
+
+def _resolve_url():
+    """Resolve control plane URL once, then cache it."""
+    global BASE_URL
+    if BASE_URL is not None:
+        return BASE_URL
+    from swarm.config import discover_control_plane
+    BASE_URL = discover_control_plane()
+    return BASE_URL
 
 
 def api_get(path: str, params: dict = None) -> dict:
     """Send a GET request to the control plane API."""
-    url = f'{BASE_URL}{path}'
+    url = f'{_resolve_url()}{path}'
     if params:
         query = '&'.join(f'{k}={v}' for k, v in params.items())
         url = f'{url}?{query}'
@@ -75,7 +84,7 @@ def api_get(path: str, params: dict = None) -> dict:
 
 def api_post(path: str, data: dict = None) -> dict:
     """Send a POST request to the control plane API."""
-    url = f'{BASE_URL}{path}'
+    url = f'{_resolve_url()}{path}'
     body = json.dumps(data or {}).encode()
     try:
         req = urllib.request.Request(url, data=body, method='POST')
@@ -91,11 +100,12 @@ def api_post(path: str, data: dict = None) -> dict:
 
 def _connection_error(error):
     """Print a clear error message when the server is unreachable."""
-    print(f'\n{C.RED}{C.BOLD}Error:{C.RESET} Cannot connect to control plane at {C.CYAN}{BASE_URL}{C.RESET}')
+    resolved = _resolve_url()
+    print(f'\n{C.RED}{C.BOLD}Error:{C.RESET} Cannot connect to control plane at {C.CYAN}{resolved}{C.RESET}')
     print(f'{C.DIM}  Detail: {error}{C.RESET}')
     print()
     print(f'  Is the server running?  {C.YELLOW}build-swarmv3 serve{C.RESET}')
-    if BASE_URL != DEFAULT_URL:
+    if os.environ.get('SWARMV3_URL'):
         print(f'  Using custom URL from SWARMV3_URL env var.')
     else:
         print(f'  Or set {C.YELLOW}SWARMV3_URL{C.RESET} if the server is on another host.')
@@ -876,7 +886,7 @@ def _drone_deploy(args):
     dry_run = args.dry_run if hasattr(args, 'dry_run') else False
 
     # Determine control plane URL
-    cp_url = os.environ.get('SWARMV3_URL', BASE_URL)
+    cp_url = _resolve_url()
 
     print_header('Drone Deployment')
     print(f'  {C.DIM}Target:{C.RESET}   {C.CYAN}{ip}{C.RESET}')
@@ -1035,7 +1045,7 @@ def cmd_bootstrap_script(args):
     if resp is None:
         # The bootstrap endpoint returns text/plain, not JSON
         # Use raw urllib to fetch it
-        url = f'{BASE_URL}/api/v1/provision/bootstrap'
+        url = f'{_resolve_url()}/api/v1/provision/bootstrap'
         try:
             req = urllib.request.Request(url)
             with urllib.request.urlopen(req, timeout=10) as r:
