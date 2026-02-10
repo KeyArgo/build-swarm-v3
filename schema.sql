@@ -1,0 +1,132 @@
+-- Build Swarm v3 - SQLite Schema
+-- Unified control plane: replaces registry.json + state.json + fleet.json
+
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
+
+-- Nodes: replaces registry.json (gateway) + drone_status (orchestrator)
+CREATE TABLE IF NOT EXISTS nodes (
+    id TEXT PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL,
+    ip TEXT,
+    tailscale_ip TEXT,
+    type TEXT CHECK(type IN ('drone','sweeper')) NOT NULL,
+    cores INTEGER,
+    ram_gb REAL,
+    status TEXT DEFAULT 'offline',
+    paused INTEGER DEFAULT 0,
+    last_seen REAL,                 -- unix timestamp for fast comparison
+    capabilities_json TEXT,         -- {arch, auto_reboot, portage_timestamp, ...}
+    metrics_json TEXT,              -- {cpu_percent, ram_percent, load_1m, ...}
+    current_task TEXT,
+    version TEXT,
+    created_at REAL DEFAULT (strftime('%s','now'))
+);
+
+-- Queue: replaces in-memory needed/delegated/received/failed lists
+CREATE TABLE IF NOT EXISTS queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    package TEXT NOT NULL,
+    status TEXT DEFAULT 'needed'
+        CHECK(status IN ('needed','delegated','received','blocked','failed')),
+    assigned_to TEXT REFERENCES nodes(id),
+    assigned_at REAL,
+    completed_at REAL,
+    failure_count INTEGER DEFAULT 0,
+    error_message TEXT,
+    session_id TEXT REFERENCES sessions(id),
+    created_at REAL DEFAULT (strftime('%s','now'))
+);
+
+-- Build history: every build attempt (for analytics)
+CREATE TABLE IF NOT EXISTS build_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    package TEXT NOT NULL,
+    drone_id TEXT,
+    drone_name TEXT,
+    status TEXT NOT NULL,
+    duration_seconds REAL,
+    error_message TEXT,
+    session_id TEXT,
+    built_at REAL DEFAULT (strftime('%s','now'))
+);
+
+-- Sessions: groups of packages from a single build run
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    name TEXT,
+    status TEXT DEFAULT 'active' CHECK(status IN ('active','completed','aborted')),
+    total_packages INTEGER DEFAULT 0,
+    completed_packages INTEGER DEFAULT 0,
+    failed_packages INTEGER DEFAULT 0,
+    started_at REAL DEFAULT (strftime('%s','now')),
+    completed_at REAL
+);
+
+-- Config: key-value store for centralized configuration
+CREATE TABLE IF NOT EXISTS config (
+    key TEXT PRIMARY KEY,
+    value TEXT,
+    updated_at REAL DEFAULT (strftime('%s','now'))
+);
+
+-- Drone health: circuit breaker state (separate from nodes for clarity)
+CREATE TABLE IF NOT EXISTS drone_health (
+    node_id TEXT PRIMARY KEY REFERENCES nodes(id),
+    failures INTEGER DEFAULT 0,
+    last_failure REAL,
+    rebooted INTEGER DEFAULT 0,
+    grounded_until REAL
+);
+
+-- Metrics time-series (ring buffer for charting)
+CREATE TABLE IF NOT EXISTS metrics_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL NOT NULL,
+    node_id TEXT,
+    cpu_percent REAL,
+    ram_percent REAL,
+    load_1m REAL,
+    queue_needed INTEGER,
+    queue_delegated INTEGER,
+    queue_received INTEGER,
+    queue_blocked INTEGER
+);
+
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_queue_status ON queue(status);
+CREATE INDEX IF NOT EXISTS idx_queue_session ON queue(session_id);
+CREATE INDEX IF NOT EXISTS idx_queue_assigned ON queue(assigned_to);
+CREATE INDEX IF NOT EXISTS idx_queue_package ON queue(package);
+CREATE INDEX IF NOT EXISTS idx_history_session ON build_history(session_id);
+CREATE INDEX IF NOT EXISTS idx_history_drone ON build_history(drone_id);
+CREATE INDEX IF NOT EXISTS idx_history_built ON build_history(built_at);
+CREATE INDEX IF NOT EXISTS idx_metrics_time ON metrics_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_metrics_node ON metrics_log(node_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status);
+CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);
+
+-- Protocol log: every HTTP request/response pair (Wireshark-style capture)
+CREATE TABLE IF NOT EXISTS protocol_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL NOT NULL,
+    source_ip TEXT,
+    source_node TEXT,
+    method TEXT NOT NULL,
+    path TEXT NOT NULL,
+    msg_type TEXT NOT NULL,
+    drone_id TEXT,
+    package TEXT,
+    session_id TEXT,
+    status_code INTEGER,
+    request_summary TEXT,
+    response_summary TEXT,
+    request_body TEXT,
+    response_body TEXT,
+    latency_ms REAL,
+    content_length INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_protocol_timestamp ON protocol_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_protocol_type ON protocol_log(msg_type);
+CREATE INDEX IF NOT EXISTS idx_protocol_drone ON protocol_log(drone_id);
+CREATE INDEX IF NOT EXISTS idx_protocol_package ON protocol_log(package);

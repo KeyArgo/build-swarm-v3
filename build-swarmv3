@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""Build Swarm v3 - CLI wrapper. See swarm/cli.py for implementation."""
+import os
+import sys
+
+# Allow running directly from project directory (not just pip-installed)
+_dir = os.path.dirname(os.path.abspath(__file__))
+if _dir not in sys.path:
+    sys.path.insert(0, _dir)
+
+from swarm.cli import main
+main()

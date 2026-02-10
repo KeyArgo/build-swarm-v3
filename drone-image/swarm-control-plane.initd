@@ -1,0 +1,48 @@
+#!/sbin/openrc-run
+# Build Swarm v3 Control Plane — OpenRC Service
+#
+# Install:
+#   cp swarm-control-plane.initd /etc/init.d/swarm-control-plane
+#   chmod +x /etc/init.d/swarm-control-plane
+#   rc-update add swarm-control-plane default
+#   rc-service swarm-control-plane start
+
+description="Build Swarm v3 Control Plane"
+supervisor=supervise-daemon
+
+command="/usr/bin/build-swarmv3"
+command_args="serve"
+command_user="root"
+command_background=true
+
+pidfile="/run/build-swarm-v3-cp.pid"
+output_log="/var/log/build-swarm-v3/control-plane.log"
+error_log="/var/log/build-swarm-v3/control-plane-error.log"
+
+respawn_delay=5
+respawn_max=10
+respawn_period=60
+
+start_pre() {
+    mkdir -p /var/log/build-swarm-v3
+    mkdir -p /var/cache/binpkgs-v3-staging
+    mkdir -p /var/cache/binpkgs-v3
+    mkdir -p /var/lib/build-swarm-v3
+
+    # If installed via pip, command is in PATH.
+    # If running from source, adjust this path:
+    if [ ! -x "$command" ]; then
+        command="/opt/build-swarm-v3/build-swarmv3"
+    fi
+
+    if [ ! -x "$command" ] && [ ! -f "$command" ]; then
+        eerror "build-swarmv3 not found at $command"
+        eerror "Install with: pip install -e /opt/build-swarm-v3"
+        return 1
+    fi
+}
+
+depend() {
+    need net
+    after firewall
+}

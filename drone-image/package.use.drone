@@ -1,0 +1,57 @@
+# Build Swarm v3 Drone — /etc/portage/package.use/swarm-drone
+# Per-package USE flags for BUILD TARGETS.
+# These ensure packages built by the drone have the right features
+# for the client machines (KDE Plasma desktops, etc.).
+# Source: swarm.json drone_portage_config.package_use
+# Updated: 2026-02-09
+
+# Global
+*/* -systemd elogind
+
+# Libraries
+sys-libs/zlib minizip
+sys-fs/fuse suid
+media-libs/libsdl2 gles2
+media-libs/freetype harfbuzz
+
+# Qt6
+dev-qt/qtbase libproxy opengl wayland icu
+dev-qt/qttools opengl
+dev-qt/qtdeclarative opengl
+dev-qt/qtmultimedia opengl
+dev-qt/qt5compat qml icu
+dev-qt/qtgui egl
+
+# KDE / Plasma
+kde-frameworks/kwindowsystem wayland X
+kde-frameworks/kconfig qml dbus
+>=kde-frameworks/kguiaddons-6.22.1 wayland
+>=kde-frameworks/kidletime-6.22.0 wayland
+kde-plasma/kwin lock
+
+# X11 / Wayland
+x11-libs/libxkbcommon X
+x11-libs/libdrm video_cards_amdgpu video_cards_radeon
+media-libs/mesa wayland
+x11-base/xwayland libei
+>=x11-libs/cairo-1.18.4-r1 X
+>=media-libs/libglvnd-1.7.0 X
+
+# Kernel
+sys-kernel/installkernel dracut
+
+# Media
+media-video/ffmpeg vpx opus
+media-plugins/alsa-plugins pulseaudio
+
+# GIMP deps
+>=media-libs/babl-0.1.118 lcms
+>=media-libs/gegl-0.4.66 lcms cairo
+
+# Network
+>=net-wireless/wpa_supplicant-2.11-r4 dbus
+>=dev-libs/qcoro-0.12.0 dbus
+
+# Build tools
+dev-build/make -*
+app-text/xmlto text

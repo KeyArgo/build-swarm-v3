@@ -1,0 +1,6 @@
+# Build Swarm v3 Drone — /etc/portage/package.accept_keywords/swarm-drone
+# Source: swarm.json drone_portage_config.accept_keywords
+# Updated: 2026-02-09
+
+dev-util/google-antigravity ~amd64
+sys-kernel/installkernel ~amd64

@@ -1,0 +1,22 @@
+# Build Swarm v3 Drone — /var/lib/portage/world
+# This is the EXACT set of packages a drone needs.
+# Everything else is a dependency pulled in by portage.
+# Expected total installed (with deps): ~250-350 packages.
+
+# Core build infrastructure (already in stage3, listed to pin)
+sys-apps/portage
+sys-devel/gcc
+sys-devel/binutils
+sys-libs/glibc
+
+# Drone runtime requirements
+dev-lang/python
+net-misc/rsync
+net-misc/openssh
+app-misc/screen
+
+# Portage query tools (equery, used by comply.sh)
+app-portage/gentoolkit
+
+# Init system
+sys-apps/openrc

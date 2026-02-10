@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "build-swarm-v3"
+dynamic = ["version"]
+description = "Distributed Gentoo binary package builder with protocol-level observability"
+requires-python = ">=3.8"
+license = "MIT"
+readme = "README.md"
+keywords = ["gentoo", "build", "distributed", "binary-packages", "swarm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Software Distribution",
+]
+
+[project.scripts]
+build-swarmv3 = "swarm.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[tool.setuptools.dynamic]
+version = {attr = "swarm.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["swarm*"]
+
+[tool.setuptools.package-data]
+swarm = ["schema.sql"]
+
+[tool.setuptools.data-files]
+"drone-image" = [
+    "drone-image/drone.spec",
+    "drone-image/make.conf.drone",
+    "drone-image/package.list",
+    "drone-image/package.use.drone",
+    "drone-image/package.accept_keywords.drone",
+    "drone-image/bootstrap.sh",
+    "drone-image/comply.sh",
+    "drone-image/comply-cron.sh",
+    "drone-image/swarm-control-plane.initd",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
