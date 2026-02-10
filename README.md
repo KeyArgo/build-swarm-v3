@@ -6,6 +6,23 @@ Gentoo Linux cluster.
 
 **Zero dependencies** -- pure Python stdlib. Works with Python 3.8+.
 
+## What's New in v3.1
+
+**v3.1.0** (2026-02-10) -- Resilient scheduling, persistent events, SQL explorer.
+
+- **Stale completion filtering**: Discards false failures from rebalanced packages (root cause of 82% failure rate in v3.0)
+- **Smart package-drone assignment**: Avoids assigning packages to drones that previously failed them
+- **Cross-drone failure detection**: Blocks packages that fail on 2+ different drones
+- **Persistent events**: Events survive control plane restarts (dual-write: memory ring buffer + SQLite)
+- **SSH health probing**: Checks process status, load, disk space, stuck emerge processes
+- **Escalation ladder**: Service restart → full reboot → manual intervention (OpenRC-aware)
+- **SQL explorer API**: Read-only SQL queries, table/schema introspection
+- **Dashboard Data tab**: SQL explorer with shortcuts, query textarea, results table
+- **Dashboard control panel**: Pause/Resume/Unblock/Rebalance/Clear Failures from the Overview tab
+- **Tuned circuit breaker**: MAX_FAILURES 5→8, GROUNDING_TIMEOUT 2→5min, FAILURE_AGE 60→30min
+- **Faster reclaim**: Offline work reclaim timeout 4h→2h
+- **Schema migrations**: Safe column additions via PRAGMA introspection
+
 ## Installation
 
 ### From source (recommended)
@@ -148,6 +165,8 @@ All non-serve commands talk to these endpoints on the running server:
 | GET | `/api/v1/history` | Build history |
 | GET | `/api/v1/sessions` | Session list |
 | GET | `/api/v1/metrics` | Metrics time-series |
+| GET | `/api/v1/events` | Recent events (ring buffer) |
+| GET | `/api/v1/events/history` | Persistent event log (SQLite) |
 | POST | `/api/v1/queue` | Add packages to queue |
 | POST | `/api/v1/control` | Send control actions |
 | POST | `/api/v1/register` | Drone registration (used by drones) |
@@ -157,6 +176,11 @@ All non-serve commands talk to these endpoints on the running server:
 | GET | `/api/v1/protocol/stats` | Protocol traffic summary |
 | GET | `/api/v1/protocol/density` | Activity histogram for replay |
 | GET | `/api/v1/protocol/snapshot` | State reconstruction at timestamp |
+| GET | `/api/v1/drone-health` | Drone health records with probe results |
+| GET | `/api/v1/build-stats/by-package` | Per-package success/failure stats |
+| GET | `/api/v1/sql/tables` | Table names and row counts |
+| GET | `/api/v1/sql/schema` | Table schemas |
+| GET | `/api/v1/sql/query?q=SELECT...` | Read-only SQL queries (SELECT only) |
 
 ## Project Structure
 
@@ -177,7 +201,7 @@ build-swarm-v3/
     scheduler.py         Work assignment and scheduling logic
     protocol_logger.py   Wireshark-style protocol capture
     provisioner.py       Drone bootstrap and SSH provisioning
-    events.py            Event ring buffer
+    events.py            Event system (ring buffer + SQLite persistence)
     schema.sql           SQLite schema (bundled with package)
   drone-image/           Drone image specification (golden spec)
     drone.spec           JSON spec: profile, packages, limits

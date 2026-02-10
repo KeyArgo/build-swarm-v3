@@ -45,11 +45,27 @@ class SwarmDB:
         return self._local.conn
 
     def _init_schema(self):
-        """Apply schema from schema.sql."""
+        """Apply schema from schema.sql, then run migrations."""
         conn = self._get_conn()
         schema = SCHEMA_FILE.read_text()
         conn.executescript(schema)
         conn.commit()
+        self._migrate()
+
+    def _migrate(self):
+        """Safe schema migrations for v3.1+ (non-destructive on existing DBs)."""
+        conn = self._get_conn()
+
+        # Check existing drone_health columns and add new ones if missing
+        try:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(drone_health)").fetchall()}
+            if 'last_probe_result' not in cols:
+                conn.execute("ALTER TABLE drone_health ADD COLUMN last_probe_result TEXT")
+            if 'last_probe_at' not in cols:
+                conn.execute("ALTER TABLE drone_health ADD COLUMN last_probe_at REAL")
+            conn.commit()
+        except Exception as e:
+            log.debug(f"Migration note: {e}")
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         """Execute SQL with automatic retry on lock."""
@@ -99,6 +115,12 @@ class SwarmDB:
         now = time.time()
         caps_json = json.dumps(capabilities) if capabilities else None
         metrics_json = json.dumps(metrics) if metrics else None
+
+        # If a different node previously claimed this name, remove the stale entry
+        existing = self.fetchone(
+            "SELECT id FROM nodes WHERE name = ? AND id != ?", (name, node_id))
+        if existing:
+            self.execute("DELETE FROM nodes WHERE id = ?", (existing['id'],))
 
         self.execute("""
             INSERT INTO nodes (id, name, ip, tailscale_ip, type, cores, ram_gb,
@@ -156,18 +178,15 @@ class SwarmDB:
 
     def update_node_status(self, timeout_seconds: int = 30,
                            stale_seconds: int = 300):
-        """Mark nodes offline/prune stale ones based on last_seen."""
+        """Mark nodes offline based on last_seen. Nodes are never auto-deleted
+        so the dashboard always has fleet data available."""
         now = time.time()
         cutoff = now - timeout_seconds
-        stale_cutoff = now - stale_seconds
 
-        # Mark offline
+        # Mark offline (but keep in DB for dashboard visibility)
         self.execute(
             "UPDATE nodes SET status = 'offline' WHERE last_seen < ? AND status = 'online'",
             (cutoff,))
-
-        # Prune stale (haven't been seen in stale_seconds)
-        self.execute("DELETE FROM nodes WHERE last_seen < ?", (stale_cutoff,))
 
     def set_node_paused(self, node_id: str, paused: bool) -> bool:
         """Pause or resume a node."""
@@ -409,6 +428,31 @@ class SwarmDB:
                 WHERE status NOT IN ('received')
             """)
         return cursor.rowcount
+
+    # ── Assignment Validation (v3.1 stale completion filtering) ──────
+
+    def is_package_assigned_to(self, package: str, drone_id: str) -> bool:
+        """Check if a package is currently delegated to this drone."""
+        return bool(self.fetchval("""
+            SELECT 1 FROM queue
+            WHERE package = ? AND assigned_to = ? AND status = 'delegated'
+            LIMIT 1
+        """, (package, drone_id)))
+
+    def has_drone_failed_package(self, drone_id: str, package: str) -> bool:
+        """Check if this drone has previously failed to build this package."""
+        return bool(self.fetchval("""
+            SELECT 1 FROM build_history
+            WHERE drone_id = ? AND package = ? AND status NOT IN ('success', 'returned')
+            LIMIT 1
+        """, (drone_id, package)))
+
+    def count_distinct_drone_failures(self, package: str) -> int:
+        """Count how many different drones have failed this package."""
+        return self.fetchval("""
+            SELECT COUNT(DISTINCT drone_id) FROM build_history
+            WHERE package = ? AND status NOT IN ('success', 'returned')
+        """, (package,)) or 0
 
     # ── Drone Health (Circuit Breaker) ────────────────────────────────
 

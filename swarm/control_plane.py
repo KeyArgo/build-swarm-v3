@@ -19,7 +19,7 @@ from . import __version__
 from . import config as cfg
 from . import protocol_logger
 from .db import SwarmDB
-from .events import add_event, get_events_since
+from .events import add_event, get_events_since, get_events_db, init_events, prune_old_events
 from .health import DroneHealthMonitor
 from .scheduler import Scheduler
 
@@ -149,7 +149,28 @@ class V3Handler(BaseHTTPRequestHandler):
             include_all = params.get('all', ['false'])[0].lower() == 'true'
             nodes = db.get_all_nodes(include_offline=include_all)
             drones = [n for n in nodes if n['type'] in ('drone', 'sweeper')]
-            self.send_json({'drones': drones, 'orchestrators': []})
+
+            # Flatten metrics and add build stats for dashboard
+            for d in drones:
+                m = d.get('metrics') or {}
+                d['cpu_percent'] = m.get('cpu_percent', 0)
+                d['ram_percent'] = m.get('ram_percent', 0)
+                # Build stats from history
+                stats = db.fetchone("""
+                    SELECT
+                        COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END), 0) as ok,
+                        COALESCE(SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END), 0) as fail
+                    FROM build_history WHERE drone_id = ?
+                """, (d['id'],))
+                d['builds_completed'] = stats['ok'] if stats else 0
+                d['builds_failed'] = stats['fail'] if stats else 0
+
+            # Return flat array for dashboard compatibility
+            fmt = params.get('format', [''])[0]
+            if fmt == 'legacy':
+                self.send_json({'drones': drones, 'orchestrators': []})
+            else:
+                self.send_json(drones)
 
         # ── Orchestrator Discovery (compatibility) ──
         elif path == '/api/v1/orchestrator':
@@ -165,12 +186,23 @@ class V3Handler(BaseHTTPRequestHandler):
             drone_id = params.get('id', ['unknown'])[0]
             result = scheduler.get_work(drone_id, self.client_address[0])
 
+            # v3.1: Include revoke list for packages rebalanced away from this drone
+            revoked = scheduler.get_stale_assignments(drone_id)
+
             if isinstance(result, dict) and result.get('action'):
+                if revoked:
+                    result['revoke'] = revoked
                 self.send_json(result)
             elif result:
-                self.send_json({'package': result})
+                resp = {'package': result}
+                if revoked:
+                    resp['revoke'] = revoked
+                self.send_json(resp)
             else:
-                self.send_json({'package': None})
+                resp = {'package': None}
+                if revoked:
+                    resp['revoke'] = revoked
+                self.send_json(resp)
 
         # ── Queue Status ──
         elif path == '/api/v1/status':
@@ -213,7 +245,7 @@ class V3Handler(BaseHTTPRequestHandler):
             # Compute dashboard-friendly fields
             online_drones = [d for d in drones if d.get('online') or d.get('status') == 'online']
             total_cores = sum(
-                (d.get('capabilities') or {}).get('cores', 0) for d in online_drones
+                (d.get('capabilities') or {}).get('cores', 0) for d in drones
             )
 
             self.send_json({
@@ -309,6 +341,98 @@ class V3Handler(BaseHTTPRequestHandler):
             events, latest_id = get_events_since(since_id)
             self.send_json({'events': events, 'latest_id': latest_id})
 
+        # ── Events History (persistent, v3.1) ──
+        elif path == '/api/v1/events/history':
+            since = params.get('since', [None])[0]
+            since_ts = float(since) if since else None
+            etype = params.get('type', [None])[0]
+            limit = int(params.get('limit', ['500'])[0])
+            events = get_events_db(since_ts=since_ts, event_type=etype, limit=limit)
+            self.send_json({'events': events, 'total': len(events)})
+
+        # ── SQL Explorer (v3.1) ──
+        elif path == '/api/v1/sql/tables':
+            tables = db.fetchall(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            result = {}
+            for t in tables:
+                count = db.fetchval(f"SELECT COUNT(*) FROM [{t['name']}]")
+                result[t['name']] = count
+            self.send_json({'tables': result})
+
+        elif path == '/api/v1/sql/schema':
+            tables = db.fetchall(
+                "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            self.send_json({'schema': [{'name': t['name'], 'sql': t['sql']} for t in tables]})
+
+        elif path == '/api/v1/sql/query':
+            query = params.get('q', [''])[0]
+            if not query:
+                self.send_json({'error': 'Missing query parameter q'}, 400)
+                return
+            # Safety: only allow SELECT
+            q_upper = query.strip().upper()
+            if not q_upper.startswith('SELECT'):
+                self.send_json({'error': 'Only SELECT queries allowed'}, 403)
+                return
+            for forbidden in ['INSERT', 'UPDATE', 'DELETE', 'DROP', 'ALTER', 'CREATE', 'ATTACH', 'DETACH']:
+                if forbidden in q_upper:
+                    self.send_json({'error': f'{forbidden} not allowed'}, 403)
+                    return
+            try:
+                conn = db._get_conn()
+                cursor = conn.execute(query)
+                columns = [desc[0] for desc in cursor.description] if cursor.description else []
+                rows = cursor.fetchmany(1000)
+                self.send_json({
+                    'columns': columns,
+                    'rows': [list(r) for r in rows],
+                    'count': len(rows),
+                })
+            except Exception as e:
+                self.send_json({'error': str(e)}, 400)
+
+        # ── Drone Health (v3.1) ──
+        elif path == '/api/v1/drone-health':
+            drones = db.get_all_nodes(include_offline=True)
+            result = []
+            for d in drones:
+                h = db.get_drone_health(d['id'])
+                probe = None
+                try:
+                    probe_json = h.get('last_probe_result')
+                    if probe_json:
+                        probe = json.loads(probe_json) if isinstance(probe_json, str) else probe_json
+                except Exception:
+                    pass
+                result.append({
+                    'drone_id': d['id'],
+                    'name': d['name'],
+                    'ip': d['ip'],
+                    'status': d['status'],
+                    'failures': h.get('failures', 0),
+                    'grounded_until': h.get('grounded_until'),
+                    'rebooted': h.get('rebooted', 0),
+                    'last_failure': h.get('last_failure'),
+                    'last_probe': probe,
+                    'last_probe_at': h.get('last_probe_at'),
+                })
+            self.send_json({'drones': result})
+
+        # ── Build Stats by Package (v3.1) ──
+        elif path == '/api/v1/build-stats/by-package':
+            rows = db.fetchall("""
+                SELECT package,
+                       COUNT(*) as attempts,
+                       SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as successes,
+                       GROUP_CONCAT(DISTINCT drone_name) as tried_on,
+                       MAX(built_at) as last_attempt
+                FROM build_history
+                GROUP BY package
+                ORDER BY attempts DESC
+            """)
+            self.send_json({'packages': [dict(r) for r in rows]})
+
         # ── Protocol Log (Wireshark-style) ──
         elif path == '/api/v1/protocol':
             since_id = int(params.get('since', ['0'])[0])
@@ -369,6 +493,38 @@ class V3Handler(BaseHTTPRequestHandler):
             self._proto_status = 200
             self._proto_content_length = len(body)
             return
+
+        # ── Queue Listing (GET) ──
+        elif path == '/api/v1/queue':
+            session = db.get_active_session()
+            session_id = session['id'] if session else None
+            where = "WHERE session_id = ?" if session_id else ""
+            p = (session_id,) if session_id else ()
+            rows = db.fetchall(f"""
+                SELECT package, status, assigned_to, failure_count,
+                       assigned_at, created_at
+                FROM queue {where}
+                ORDER BY
+                    CASE status
+                        WHEN 'delegated' THEN 1
+                        WHEN 'needed' THEN 2
+                        WHEN 'blocked' THEN 3
+                        WHEN 'failed' THEN 4
+                        WHEN 'received' THEN 5
+                    END, id
+            """, p)
+            result = []
+            for r in rows:
+                drone_name = None
+                if r['assigned_to']:
+                    drone_name = db.get_drone_name(r['assigned_to'])
+                result.append({
+                    'package': r['package'],
+                    'status': r['status'],
+                    'assigned_to': drone_name,
+                    'failures': r['failure_count'],
+                })
+            self.send_json(result)
 
         else:
             self.send_json({'error': 'Not found'}, 404)
@@ -460,6 +616,21 @@ class V3Handler(BaseHTTPRequestHandler):
 
             drone_name = db.get_drone_name(drone_id)
 
+            # v3.1: Check if this is a stale completion from a rebalanced package
+            is_valid = scheduler.is_valid_assignment(drone_id, package)
+
+            if not is_valid and status != 'success':
+                # DISCARD stale failures — don't poison circuit breaker or failure counts
+                log.info(f"[STALE-FAIL] {package} from {drone_name} — ignoring (no longer assigned)")
+                add_event('stale', f"{package} stale failure from {drone_name} (discarded)",
+                          {'package': package, 'drone': drone_name, 'status': status})
+                self.send_json({'status': 'ok', 'accepted': False, 'stale': True})
+                return
+
+            if not is_valid and status == 'success':
+                # Accept free work but log warning
+                log.info(f"[STALE-OK] {package} from {drone_name} — accepting (free work)")
+
             # Handle success with validation
             if status == 'success':
                 if not _is_virtual_package(package) and 'app-test/dummy-' not in package:
@@ -490,6 +661,23 @@ class V3Handler(BaseHTTPRequestHandler):
                 add_event('fail', f"{package} failed on {drone_name}: {status}",
                           {'package': package, 'drone': drone_name, 'status': status,
                            'error': error_detail[:200] if error_detail else ''})
+
+                # v3.1: Cross-drone failure detection — if 2+ drones fail this package,
+                # block it immediately (it's a package problem, not a drone problem)
+                distinct_failures = db.count_distinct_drone_failures(package)
+                if distinct_failures >= 2:
+                    # Check if already blocked
+                    q = db.fetchone(
+                        "SELECT status FROM queue WHERE package = ? AND status != 'received'",
+                        (package,))
+                    if q and q['status'] not in ('blocked', 'received'):
+                        db.execute("""
+                            UPDATE queue SET status = 'blocked', error_message = ?
+                            WHERE package = ? AND status IN ('needed', 'delegated')
+                        """, (f"Failed on {distinct_failures} different drones", package))
+                        log.warning(f"[CROSS-FAIL] {package} blocked — failed on {distinct_failures} drones")
+                        add_event('fail', f"{package} blocked (failed on {distinct_failures} drones)",
+                                  {'package': package, 'distinct_drones': distinct_failures})
 
             self.send_json({'status': 'ok', 'accepted': status == 'success'})
 
@@ -755,13 +943,54 @@ def _maintenance_loop():
 
 
 def _protocol_prune_loop():
-    """Prune protocol log entries older than 24h every 5 minutes."""
+    """Prune protocol log entries older than 24h and events older than 7d."""
     while True:
         time.sleep(300)
         try:
             protocol_logger.prune_old_entries(db, max_age_hours=24)
+            prune_old_events(max_age_days=7)
         except Exception as e:
-            log.error(f"Protocol prune error: {e}")
+            log.error(f"Protocol/event prune error: {e}")
+
+
+def _drone_health_probe_loop():
+    """Proactively probe drones every 60 seconds for health issues.
+
+    v3.1: SSH-based health checks for:
+    - Drones idle >5min but supposedly online
+    - Drones with >3 recent failures
+    """
+    while True:
+        time.sleep(60)
+        try:
+            drones = db.get_all_nodes(include_offline=False)
+            now = time.time()
+
+            for d in drones:
+                drone_id = d['id']
+                drone_ip = d.get('ip')
+                if not drone_ip:
+                    continue
+
+                # Check if drone has >3 failures
+                health = db.get_drone_health(drone_id)
+                failures = health.get('failures', 0)
+
+                # Only probe drones that seem problematic
+                should_probe = False
+                if failures >= 3:
+                    should_probe = True
+
+                if should_probe:
+                    result = health_monitor.probe_drone_health(drone_id, drone_ip)
+                    if result.get('status') == 'service_down':
+                        # Auto-restart the service
+                        log.warning(f"[PROBE] {d['name']}: service down, restarting")
+                        health_monitor.restart_drone_service(drone_id, drone_ip)
+                        add_event('control', f"{d['name']} service auto-restarted (probe detected down)",
+                                  {'drone': d['name'], 'probe_status': result.get('status')})
+        except Exception as e:
+            log.error(f"Health probe error: {e}")
 
 
 def _session_monitor():
@@ -800,6 +1029,9 @@ def start(db_path: str = None, port: int = None):
     health_monitor = DroneHealthMonitor(db)
     scheduler = Scheduler(db, health_monitor)
 
+    # v3.1: Initialize persistent events (hydrate ring buffer from SQLite)
+    init_events(db)
+
     log.info(f"=== Build Swarm v3 Control Plane v{__version__} ===")
     log.info(f"Database: {db_path}")
     log.info(f"Port: {port}")
@@ -821,7 +1053,8 @@ def start(db_path: str = None, port: int = None):
     threading.Thread(target=_maintenance_loop, daemon=True).start()
     threading.Thread(target=_session_monitor, daemon=True).start()
     threading.Thread(target=_protocol_prune_loop, daemon=True).start()
-    log.info("Background threads started (metrics, maintenance, session monitor, protocol prune)")
+    threading.Thread(target=_drone_health_probe_loop, daemon=True).start()
+    log.info("Background threads started (metrics, maintenance, session monitor, protocol/event prune, health probe)")
 
     # Start HTTP server
     server = ThreadingHTTPServer(('0.0.0.0', port), V3Handler)

@@ -23,6 +23,25 @@ class Scheduler:
     def __init__(self, db: SwarmDB, health: DroneHealthMonitor):
         self.db = db
         self.health = health
+        # Track packages rebalanced away from drones (drone_id -> set of packages)
+        self._rebalanced = {}  # type: dict[str, set[str]]
+
+    def is_valid_assignment(self, drone_id: str, package: str) -> bool:
+        """Check if a package is currently assigned to this drone.
+
+        Used to filter stale completions from v2 agents that keep building
+        packages after rebalancing has reassigned them.
+        """
+        return self.db.is_package_assigned_to(package, drone_id)
+
+    def get_stale_assignments(self, drone_id: str) -> list:
+        """Get packages that were rebalanced away from this drone.
+
+        Returns list of package names the drone should stop building.
+        Clears the tracking after returning (one-shot notification).
+        """
+        stale = list(self._rebalanced.pop(drone_id, set()))
+        return stale
 
     def get_work(self, drone_id: str, drone_ip: str = None) -> Optional[Any]:
         """Get next package for a drone to build.
@@ -84,8 +103,8 @@ class Scheduler:
         else:
             queue_target = cfg.QUEUE_TARGET
 
-        # Get needed packages
-        needed = self.db.get_needed_packages(limit=queue_target)
+        # Get needed packages (fetch extra to have alternatives if some are skipped)
+        needed = self.db.get_needed_packages(limit=queue_target * 3)
 
         if not needed:
             # Try auto-balance (steal from overloaded drones)
@@ -95,9 +114,11 @@ class Scheduler:
                 return assigned[0]['package'] if assigned else None
             return None
 
-        # Assign packages up to queue target
+        # Assign packages up to queue target, skipping packages this drone
+        # has previously failed (prevents same-drone-same-failure loops)
         first_package = None
         assigned_count = 0
+        skipped = 0
 
         for pkg_row in needed:
             if assigned_count >= queue_target:
@@ -106,11 +127,20 @@ class Scheduler:
             package = pkg_row['package']
             queue_id = pkg_row['id']
 
+            # v3.1: Skip packages this drone has already failed
+            if self.db.has_drone_failed_package(drone_id, package):
+                skipped += 1
+                log.debug(f"[SKIP] {package} — {drone_name} previously failed this")
+                continue
+
             if self.db.assign_package(queue_id, drone_id):
                 if first_package is None:
                     first_package = package
                 assigned_count += 1
                 log.info(f"[ASSIGN] {package} -> {drone_name}")
+
+        if skipped > 0:
+            log.info(f"[ASSIGN] {drone_name}: skipped {skipped} previously-failed packages")
 
         if assigned_count > 0:
             log.info(f"[QUEUE] {drone_name}: {assigned_count} pkgs assigned "
@@ -224,6 +254,11 @@ class Scheduler:
                     WHERE id = ? AND assigned_to = ? AND status = 'delegated'
                 """, (drone_id, time.time(), pkg['id'], donor_id))
 
+                # v3.1: Track rebalanced packages so stale completions can be discarded
+                if donor_id not in self._rebalanced:
+                    self._rebalanced[donor_id] = set()
+                self._rebalanced[donor_id].add(pkg['package'])
+
                 stolen += 1
                 taken += 1
                 log.info(f"[REBALANCE] {pkg['package']}: {donor_name_str} -> {drone_name}")
@@ -236,7 +271,7 @@ class Scheduler:
 
         return stolen
 
-    def reclaim_offline_work(self, timeout_hours: int = 4):
+    def reclaim_offline_work(self, timeout_hours: int = 2):
         """Reclaim work from offline/timed-out drones."""
         cutoff = time.time() - (timeout_hours * 3600)
         delegated = self.db.get_delegated_packages()

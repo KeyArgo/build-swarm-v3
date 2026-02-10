@@ -49,7 +49,7 @@ build-swarmv3 serve
 You should see:
 
 ```
-Build Swarm v3 Control Plane v3.0.0
+Build Swarm v3 Control Plane v3.1.0
 Starting server on port 8100...
 ```
 

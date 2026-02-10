@@ -1,9 +1,11 @@
 """
 Drone health monitoring and circuit breaker for Build Swarm v3.
 
-Ported from swarm-orchestrator's drone_health logic.
+v3.1: Added SSH-based health probing, service restart escalation,
+and escalation ladder (restart → reboot → manual intervention).
 """
 
+import json
 import logging
 import subprocess
 import threading
@@ -25,8 +27,12 @@ class DroneHealthMonitor:
     def check_grounded(self, drone_id: str, drone_ip: str = None) -> bool:
         """Check if a drone is grounded (too many failures).
 
+        v3.1 escalation ladder:
+        1. First grounding: restart service via SSH (less destructive)
+        2. Second grounding (already rebooted=0): full reboot via SSH
+        3. After reboot: if still failing, ground indefinitely
+
         Returns True if grounded (should NOT receive work).
-        Handles grounding timeout and auto-reboot.
         """
         health = self.db.get_drone_health(drone_id)
         failures = health.get('failures', 0)
@@ -57,9 +63,15 @@ class DroneHealthMonitor:
             # Reclaim all work from grounded drone
             self._reclaim_drone_work(drone_id)
 
-            # Auto-reboot if eligible
-            if drone_ip and not health.get('rebooted'):
-                self._try_reboot(drone_id, drone_ip)
+            # v3.1 Escalation ladder
+            if drone_ip:
+                rebooted = health.get('rebooted', 0)
+                if not rebooted:
+                    # First escalation: try service restart (less destructive)
+                    self.restart_drone_service(drone_id, drone_ip)
+                else:
+                    # Already tried restart, escalate to full reboot
+                    self._try_reboot(drone_id, drone_ip)
 
         return True
 
@@ -82,6 +94,39 @@ class DroneHealthMonitor:
 
         if packages:
             log.info(f"[GROUNDED] Reclaimed {len(packages)} packages from {drone_name}")
+
+    def restart_drone_service(self, drone_id: str, drone_ip: str):
+        """Restart the swarm-drone service via SSH (less destructive than reboot).
+
+        Uses OpenRC: rc-service swarm-drone restart
+        """
+        if drone_ip in cfg.PROTECTED_HOSTS:
+            return
+
+        drone_name = self.db.get_drone_name(drone_id)
+
+        def run_restart():
+            try:
+                log.warning(f"[RESTART] Restarting swarm-drone on {drone_name} ({drone_ip})")
+                result = subprocess.run(
+                    ['ssh', '-o', 'ConnectTimeout=5',
+                     '-o', 'StrictHostKeyChecking=no',
+                     f'root@{drone_ip}',
+                     'rc-service swarm-drone restart 2>&1 || /opt/build-swarm/bin/swarm-drone &'],
+                    timeout=30, capture_output=True, text=True
+                )
+                if result.returncode == 0:
+                    log.info(f"[RESTART] {drone_name} service restarted successfully")
+                    add_event('control', f"{drone_name} service restarted via SSH",
+                              {'drone': drone_name, 'ip': drone_ip})
+                else:
+                    log.error(f"[RESTART] {drone_name} restart failed: {result.stderr[:200]}")
+            except Exception as e:
+                log.error(f"[RESTART] Failed for {drone_name}: {e}")
+
+        threading.Thread(target=run_restart, daemon=True).start()
+        # Mark as rebooted=1 so next grounding escalates to full reboot
+        self.db.mark_drone_rebooted(drone_id)
 
     def _try_reboot(self, drone_id: str, drone_ip: str):
         """Attempt to reboot a drone (safety-checked)."""
@@ -112,8 +157,94 @@ class DroneHealthMonitor:
                 log.error(f"[REBOOT] Failed for {drone_name}: {e}")
 
         threading.Thread(target=run_reboot, daemon=True).start()
-        self.db.mark_drone_rebooted(drone_id)
+        add_event('control', f"{drone_name} rebooted via SSH (escalation)",
+                  {'drone': drone_name, 'ip': drone_ip})
         log.warning(f"[REBOOT] Triggered for {drone_name} ({drone_ip})")
+
+    def probe_drone_health(self, drone_id: str, drone_ip: str) -> dict:
+        """SSH-based health probe: check process, load, disk, stuck emerge.
+
+        Returns dict with probe results. Non-blocking (runs inline).
+        """
+        if not drone_ip or drone_ip in cfg.PROTECTED_HOSTS:
+            return {'status': 'skipped', 'reason': 'protected or no IP'}
+
+        drone_name = self.db.get_drone_name(drone_id)
+        result = {
+            'drone': drone_name,
+            'ip': drone_ip,
+            'timestamp': time.time(),
+            'checks': {},
+        }
+
+        try:
+            # Single SSH call to check multiple things at once
+            cmd = (
+                "echo PROC=$(pgrep -c -f swarm-drone 2>/dev/null || echo 0);"
+                "echo LOAD=$(cat /proc/loadavg | cut -d' ' -f1);"
+                "echo DISK=$(df /var/cache 2>/dev/null | tail -1 | awk '{print $5}' | tr -d '%');"
+                "echo EMERGE=$(pgrep -c -f 'emerge.*ebuild' 2>/dev/null || echo 0);"
+                "echo UPTIME=$(cat /proc/uptime | cut -d' ' -f1)"
+            )
+            proc = subprocess.run(
+                ['ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
+                 f'root@{drone_ip}', cmd],
+                timeout=15, capture_output=True, text=True
+            )
+
+            if proc.returncode != 0:
+                result['status'] = 'unreachable'
+                result['error'] = proc.stderr[:200]
+                return result
+
+            # Parse output
+            for line in proc.stdout.strip().split('\n'):
+                if '=' in line:
+                    key, val = line.split('=', 1)
+                    result['checks'][key.strip()] = val.strip()
+
+            result['status'] = 'ok'
+
+            # Analyze results
+            procs = int(result['checks'].get('PROC', '0'))
+            load = float(result['checks'].get('LOAD', '0'))
+            disk = int(result['checks'].get('DISK', '0') or '0')
+
+            if procs == 0:
+                result['status'] = 'service_down'
+                log.warning(f"[PROBE] {drone_name}: swarm-drone service NOT running")
+            if load > 20:
+                result['status'] = 'overloaded'
+                log.warning(f"[PROBE] {drone_name}: load {load} (very high)")
+            if disk > 90:
+                result['status'] = 'disk_full'
+                log.warning(f"[PROBE] {drone_name}: disk {disk}% full")
+
+        except subprocess.TimeoutExpired:
+            result['status'] = 'timeout'
+        except Exception as e:
+            result['status'] = 'error'
+            result['error'] = str(e)
+
+        # Store probe result in drone_health table
+        try:
+            self.db.execute("""
+                INSERT INTO drone_health (node_id, failures, last_failure)
+                VALUES (?, 0, NULL)
+                ON CONFLICT(node_id) DO UPDATE SET node_id = node_id
+            """, (drone_id,))
+            # Update probe columns if they exist
+            try:
+                self.db.execute("""
+                    UPDATE drone_health SET last_probe_result = ?, last_probe_at = ?
+                    WHERE node_id = ?
+                """, (json.dumps(result), time.time(), drone_id))
+            except Exception:
+                pass  # Columns may not exist yet (pre-migration)
+        except Exception:
+            pass
+
+        return result
 
     def unground_all(self) -> int:
         """Unground all drones."""

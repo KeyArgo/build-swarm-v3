@@ -130,3 +130,16 @@ CREATE INDEX IF NOT EXISTS idx_protocol_timestamp ON protocol_log(timestamp);
 CREATE INDEX IF NOT EXISTS idx_protocol_type ON protocol_log(msg_type);
 CREATE INDEX IF NOT EXISTS idx_protocol_drone ON protocol_log(drone_id);
 CREATE INDEX IF NOT EXISTS idx_protocol_package ON protocol_log(package);
+
+-- Events: persistent activity feed (v3.1)
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL NOT NULL DEFAULT (strftime('%s','now')),
+    event_type TEXT NOT NULL,
+    message TEXT NOT NULL,
+    details_json TEXT,
+    drone_id TEXT,
+    package TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
+CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
