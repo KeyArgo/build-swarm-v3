@@ -60,6 +60,12 @@ class Scheduler:
             log.debug(f"Paused, no work for {drone_name}")
             return None
 
+        # Per-drone pause check (e.g., NAS priority yield)
+        node_check = self.db.get_node(drone_id)
+        if node_check and node_check.get('paused'):
+            log.debug(f"Drone paused, no work for {drone_name}")
+            return None
+
         # Portage sync check
         expected_ts = self.db.get_config('expected_portage_timestamp')
         if expected_ts:
@@ -103,6 +109,11 @@ class Scheduler:
         cores = 0
         if node:
             cores = node.get('cores') or node.get('capabilities', {}).get('cores', 0)
+
+        # Apply per-drone cores_limit if configured (e.g., NAS priority yield)
+        drone_cfg = self.db.get_drone_config(drone_name)
+        if drone_cfg and drone_cfg.get('cores_limit'):
+            cores = min(cores, drone_cfg['cores_limit'])
 
         if cores > 0:
             queue_target = max(1, cores // cfg.CORES_PER_SLOT)
@@ -173,6 +184,10 @@ class Scheduler:
         cores = 0
         if node:
             cores = node.get('cores') or node.get('capabilities', {}).get('cores', 0)
+        # Apply per-drone cores_limit if configured
+        drone_cfg = self.db.get_drone_config(drone_name)
+        if drone_cfg and drone_cfg.get('cores_limit'):
+            cores = min(cores, drone_cfg['cores_limit'])
         queue_target = max(1, cores // cfg.CORES_PER_SLOT) if cores > 0 else cfg.QUEUE_TARGET
 
         for pkg_row in blocked:
