@@ -808,6 +808,34 @@ class SwarmDB:
             'per_drone': per_drone,
         }
 
+    def get_estimated_duration(self, package: str) -> Optional[float]:
+        """Estimate build duration for a package from history.
+
+        Tries exact match first, then category average, then global average.
+        """
+        # Exact package match
+        dur = self.fetchval("""
+            SELECT AVG(duration_seconds) FROM build_history
+            WHERE package = ? AND status = 'success' AND duration_seconds > 0
+        """, (package,))
+        if dur:
+            return round(dur, 1)
+        # Category average (e.g. sys-devel/*)
+        cat = package.lstrip('=').split('/')[0] if '/' in package else None
+        if cat:
+            dur = self.fetchval("""
+                SELECT AVG(duration_seconds) FROM build_history
+                WHERE package LIKE ? AND status = 'success' AND duration_seconds > 0
+            """, (f'{cat}/%',))
+            if dur:
+                return round(dur, 1)
+        # Global average
+        dur = self.fetchval("""
+            SELECT AVG(duration_seconds) FROM build_history
+            WHERE status = 'success' AND duration_seconds > 0
+        """)
+        return round(dur, 1) if dur else None
+
     def get_metrics_aggregated(self, since: float, bucket_seconds: int = 60) -> List[dict]:
         """Get metrics aggregated into time buckets for charting."""
         rows = self.fetchall("""

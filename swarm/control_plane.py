@@ -179,12 +179,24 @@ class V3Handler(BaseHTTPRequestHandler):
             drones = [n for n in nodes if n['type'] in ('drone', 'sweeper')]
 
             # Build assignment map from queue (delegated packages per drone)
+            now = time.time()
             assignment_map = {}
             for p in db.get_delegated_packages():
                 did = p['assigned_to']
                 if did not in assignment_map:
                     assignment_map[did] = []
-                assignment_map[did].append(p['package'])
+                pkg = p['package']
+                bs = p.get('building_since')
+                elapsed = round(now - bs, 1) if bs else None
+                est = db.get_estimated_duration(pkg) if bs else None
+                pct = min(99, round(elapsed / est * 100)) if (elapsed and est and est > 0) else None
+                assignment_map[did].append({
+                    'package': pkg,
+                    'building_since': bs,
+                    'elapsed_s': elapsed,
+                    'estimated_s': est,
+                    'progress_pct': pct,
+                })
 
             # Flatten metrics and add build stats for dashboard
             for d in drones:
@@ -192,7 +204,9 @@ class V3Handler(BaseHTTPRequestHandler):
                 d['cpu_percent'] = m.get('cpu_percent', 0)
                 d['ram_percent'] = m.get('ram_percent', 0)
                 # v3.2: Include CP-assigned packages (vs current_task which is emerge dep)
-                d['assigned_packages'] = assignment_map.get(d['id'], [])
+                builds = assignment_map.get(d['id'], [])
+                d['assigned_packages'] = [b['package'] for b in builds]
+                d['build_progress'] = builds
                 # Build stats from history
                 stats = db.fetchone("""
                     SELECT
@@ -248,13 +262,25 @@ class V3Handler(BaseHTTPRequestHandler):
             session = db.get_active_session()
             drones = db.get_all_nodes(include_offline=True)
 
-            # Build assignment map from delegated packages
+            # Build assignment map from delegated packages (with progress)
+            now = time.time()
             assign_map = {}
+            assign_progress = {}
             for p in db.get_delegated_packages():
                 did = p['assigned_to']
+                pkg = p['package']
                 if did not in assign_map:
                     assign_map[did] = []
-                assign_map[did].append(p['package'])
+                    assign_progress[did] = []
+                assign_map[did].append(pkg)
+                bs = p.get('building_since')
+                elapsed = round(now - bs, 1) if bs else None
+                est = db.get_estimated_duration(pkg) if bs else None
+                pct = min(99, round(elapsed / est * 100)) if (elapsed and est and est > 0) else None
+                assign_progress[did].append({
+                    'package': pkg, 'elapsed_s': elapsed,
+                    'estimated_s': est, 'progress_pct': pct,
+                })
 
             # Build drone status map (keyed by name, not raw ID)
             drone_status = {}
@@ -267,6 +293,7 @@ class V3Handler(BaseHTTPRequestHandler):
                     'status': d['status'],
                     'current_task': d.get('current_task'),
                     'assigned_packages': assign_map.get(d['id'], []),
+                    'build_progress': assign_progress.get(d['id'], []),
                     'capabilities': d.get('capabilities', {}),
                     'metrics': d.get('metrics', {}),
                     'last_seen': d.get('last_seen'),

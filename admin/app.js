@@ -150,21 +150,36 @@ function fmtPct(val) {
 
 function formatDroneTask(node) {
   const assigned = node.assigned_packages || [];
+  const progress = node.build_progress || [];
   const emerging = node.current_task || '';
   if (assigned.length === 0 && !emerging) {
     return '<span style="color:var(--text-muted)">idle</span>';
   }
+  const short = pkg => pkg.replace(/^=/, '').replace(/^[a-z]+-[a-z]+\//, m => m.split('/')[0].slice(0,3) + '/');
   let html = '';
-  if (assigned.length > 0) {
-    // Show first assigned package prominently, abbreviate category
-    const short = pkg => pkg.replace(/^[a-z]+-[a-z]+\//, m => m.split('/')[0].slice(0,3) + '/');
+  if (progress.length > 0) {
+    // Show assigned packages with progress bars
+    progress.slice(0, 2).forEach(b => {
+      const pct = b.progress_pct;
+      const elapsed = b.elapsed_s ? fmtDuration(b.elapsed_s) : '';
+      const est = b.estimated_s ? fmtDuration(b.estimated_s) : '';
+      html += `<span style="color:var(--green)" title="${b.package}">${short(b.package)}</span>`;
+      if (pct != null) {
+        const barColor = pct < 50 ? 'var(--cyan)' : pct < 85 ? 'var(--green)' : 'var(--yellow)';
+        html += `<div style="background:rgba(255,255,255,0.08);border-radius:3px;height:4px;margin:1px 0;width:100%">` +
+          `<div style="background:${barColor};height:100%;border-radius:3px;width:${pct}%" title="${pct}% — ${elapsed}/${est}"></div></div>`;
+      } else if (elapsed) {
+        html += ` <span style="color:var(--text-muted);font-size:0.6rem">${elapsed}</span>`;
+      }
+    });
+    if (progress.length > 2) html += `<span style="color:var(--text-muted)">+${progress.length - 2} more</span>`;
+  } else if (assigned.length > 0) {
     html += assigned.slice(0, 2).map(p =>
       `<span style="color:var(--green)" title="${p}">${short(p)}</span>`
     ).join(', ');
     if (assigned.length > 2) html += ` <span style="color:var(--text-muted)">+${assigned.length - 2}</span>`;
   }
   if (emerging) {
-    // Show current emerge as secondary — dim if it differs from assigned (i.e. it's a dep)
     const isDep = assigned.length > 0 && !assigned.includes(emerging);
     if (assigned.length > 0) html += '<br>';
     if (isDep) {
@@ -174,6 +189,14 @@ function formatDroneTask(node) {
     }
   }
   return html;
+}
+
+function fmtDuration(seconds) {
+  if (seconds == null) return '';
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  if (m >= 60) return `${Math.floor(m/60)}h${m%60}m`;
+  return `${m}m${s < 10 ? '0' : ''}${s}s`;
 }
 
 // ── Connection status ──
@@ -1385,12 +1408,23 @@ async function refreshTopology() {
     const online = d.status === 'online';
     const color = online ? '#06b6d4' : '#ef4444';
     const ap = d.assigned_packages || [];
-    const task = ap.length > 0 ? ap[0].replace(/^[a-z]+-[a-z]+\//, m => m.split('/')[0].slice(0,3) + '/') : (d.current_task || '');
+    const bp = d.build_progress || [];
+    const shortPkg = pkg => pkg.replace(/^=/, '').replace(/^[a-z]+-[a-z]+\//, m => m.split('/')[0].slice(0,3) + '/');
+    const task = ap.length > 0 ? shortPkg(ap[0]) : (d.current_task || '');
+    const pct = bp.length > 0 && bp[0].progress_pct != null ? bp[0].progress_pct : null;
+    const boxH = task ? (pct != null ? 56 : 48) : 35;
     svg += `<line x1="${W/2}" y1="60" x2="${x}" y2="${droneY}" stroke="${color}" stroke-width="0.5" opacity="0.3"/>`;
-    svg += `<rect x="${x-55}" y="${droneY}" width="110" height="${task ? 48 : 35}" class="node-box" fill="#0f172a" stroke="${color}" stroke-width="1"/>`;
+    svg += `<rect x="${x-55}" y="${droneY}" width="110" height="${boxH}" class="node-box" fill="#0f172a" stroke="${color}" stroke-width="1"/>`;
     svg += `<text x="${x}" y="${droneY+15}" text-anchor="middle" fill="${color}" font-weight="500">${d.name || id}</text>`;
     svg += `<text x="${x}" y="${droneY+27}" text-anchor="middle" class="label">${d.ip || ''}</text>`;
     if (task) svg += `<text x="${x}" y="${droneY+40}" text-anchor="middle" style="font-size:8px" fill="${ap.length > 0 ? '#22c55e' : '#94a3b8'}">${task}</text>`;
+    if (pct != null) {
+      // Progress bar
+      const barW = 90, barH = 5, barX = x - barW/2, barY = droneY + 44;
+      svg += `<rect x="${barX}" y="${barY}" width="${barW}" height="${barH}" rx="2" fill="rgba(255,255,255,0.1)"/>`;
+      svg += `<rect x="${barX}" y="${barY}" width="${Math.max(2, barW * pct / 100)}" height="${barH}" rx="2" fill="#22c55e"/>`;
+      svg += `<text x="${x + barW/2 + 4}" y="${barY + 4}" style="font-size:7px" fill="#94a3b8">${pct}%</text>`;
+    }
   });
 
   if (drones.length === 0) {
