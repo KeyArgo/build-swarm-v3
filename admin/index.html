@@ -428,6 +428,34 @@
       </div>
     </div>
 
+    <!-- Drone Version Management -->
+    <div class="section-card">
+      <h3>Drone Versions</h3>
+      <p style="color:var(--text-dim);font-size:0.8rem;margin-bottom:1rem">
+        View drone software versions and payload update status.
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Drone</th>
+              <th>IP</th>
+              <th>Version</th>
+              <th>Status</th>
+              <th>Last Seen</th>
+            </tr>
+          </thead>
+          <tbody id="drone-version-tbody">
+            <tr><td colspan="5" class="empty-state">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div style="margin-top:0.75rem;padding:0.5rem;background:var(--surface);border-radius:4px;font-size:0.8rem">
+        <strong>Payload System:</strong>
+        <span id="payload-status" style="color:var(--text-muted)">checking...</span>
+      </div>
+    </div>
+
     <!-- Drone Package Allowlist -->
     <div class="section-card">
       <h3>Package Allowlist</h3>

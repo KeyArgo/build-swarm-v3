@@ -448,6 +448,15 @@ class AdminHandler(BaseHTTPRequestHandler):
             self._handle_drone_log(cp, drone_name, params)
             return
 
+        # Drone version management
+        if path == '/admin/api/drones/versions':
+            self._handle_drone_versions(cp)
+            return
+
+        if path == '/admin/api/drones/payload':
+            self._handle_drone_payload()
+            return
+
         # V2 proxy (GET endpoints)
         if path == '/admin/api/v2/nodes':
             self._proxy_v2('/api/v1/nodes?all=true')
@@ -663,6 +672,58 @@ class AdminHandler(BaseHTTPRequestHandler):
             })
         except Exception as e:
             self.send_error_json(500, f'SSH failed: {e}')
+
+    def _handle_drone_versions(self, cp):
+        """Show version info for all drones + payload status."""
+        import time
+        nodes = cp.db.get_all_nodes(include_offline=True) if cp.db else []
+        drones = []
+        for n in nodes:
+            if n['type'] != 'drone':
+                continue
+            last_seen = n.get('last_seen')
+            ago = round(time.time() - last_seen) if last_seen else None
+            drones.append({
+                'name': n['name'],
+                'id': n['id'],
+                'ip': n.get('ip'),
+                'version': n.get('version'),
+                'status': n.get('status'),
+                'last_seen_ago_s': ago,
+            })
+
+        # Check payload manifest from v2 gateway
+        payload_info = None
+        try:
+            import urllib.request
+            url = f"{cfg.V2_GATEWAY_URL}/api/v1/payload/manifest"
+            req = urllib.request.Request(url, headers={'Accept': 'application/json'})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                payload_info = json.loads(resp.read().decode())
+        except Exception:
+            pass
+
+        self.send_json({
+            'drones': drones,
+            'payload': {
+                'available': payload_info is not None,
+                'version': payload_info.get('version') if payload_info else None,
+                'component_count': len(payload_info.get('components', {})) if payload_info else 0,
+            } if payload_info else {'available': False},
+        })
+
+    def _handle_drone_payload(self):
+        """Get the full payload manifest from v2 gateway."""
+        try:
+            import urllib.request
+            url = f"{cfg.V2_GATEWAY_URL}/api/v1/payload/manifest"
+            req = urllib.request.Request(url, headers={'Accept': 'application/json'})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                manifest = json.loads(resp.read().decode())
+            self.send_json(manifest)
+        except Exception as e:
+            self.send_json({'error': f'Failed to fetch payload manifest: {e}',
+                            'hint': 'The v2 gateway must be running to serve payloads'})
 
     def _handle_drone_log(self, cp, drone_name: str, params: dict):
         """Combined event + build history log for a specific drone."""

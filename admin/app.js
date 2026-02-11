@@ -295,7 +295,7 @@ async function refresh() {
   const tab = active.id.replace('tab-', '');
 
   if (tab === 'fleet') await refreshFleet();
-  else if (tab === 'drone-mgmt') { await refreshDroneConfigs(); await refreshAllowlist(); populateAuditDroneSelect(window._lastV3Nodes); }
+  else if (tab === 'drone-mgmt') { await refreshDroneConfigs(); await refreshDroneVersions(); await refreshAllowlist(); populateAuditDroneSelect(window._lastV3Nodes); }
   else if (tab === 'binhost') await refreshBinhost();
   else if (tab === 'queue') await refreshQueue();
   else if (tab === 'history') await refreshHistory();
@@ -620,6 +620,43 @@ async function controlAction(action, btn) {
 }
 
 // ── Drone Management tab ──
+
+async function refreshDroneVersions() {
+  const data = await adminGet('/drones/versions');
+  if (!data) return;
+
+  const tbody = $('#drone-version-tbody');
+  if (!tbody) return;
+
+  const drones = data.drones || [];
+  if (drones.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty-state">No drones registered</td></tr>';
+  } else {
+    tbody.innerHTML = drones.map(d => {
+      const ago = d.last_seen_ago_s;
+      const agoText = ago != null ? (ago < 60 ? `${ago}s ago` : ago < 3600 ? `${Math.floor(ago/60)}m ago` : `${Math.floor(ago/3600)}h ago`) : 'never';
+      const versionColor = d.version ? 'var(--green)' : 'var(--red)';
+      return `<tr>
+        <td><strong>${d.name}</strong></td>
+        <td class="mono">${d.ip || '-'}</td>
+        <td style="color:${versionColor}">${d.version || 'unknown'}</td>
+        <td><span class="badge ${d.status || 'offline'}">${d.status || 'offline'}</span></td>
+        <td style="color:var(--text-muted)">${agoText}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  // Payload status
+  const ps = $('#payload-status');
+  if (ps) {
+    const p = data.payload || {};
+    if (p.available) {
+      ps.innerHTML = `<span style="color:var(--green)">Active</span> — manifest v${p.version || '?'}, ${p.component_count} components`;
+    } else {
+      ps.innerHTML = '<span style="color:var(--text-muted)">Not available (v2 gateway may be offline)</span>';
+    }
+  }
+}
 
 async function refreshDroneConfigs() {
   const configs = await adminGet('/drone-configs');
