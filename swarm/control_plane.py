@@ -9,10 +9,11 @@ import json
 import logging
 import os
 import socket
+import subprocess
 import threading
 import time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import urlparse, parse_qs
 
 from . import __version__
@@ -41,6 +42,32 @@ def get_self_ip() -> str:
         return ip
     except Exception:
         return "127.0.0.1"
+
+
+def get_self_tailscale_ip() -> Optional[str]:
+    """Get this machine's Tailscale IP (if available). Cached after first call."""
+    if not hasattr(get_self_tailscale_ip, '_cached'):
+        try:
+            result = subprocess.run(['tailscale', 'ip', '-4'],
+                                    capture_output=True, text=True, timeout=5)
+            get_self_tailscale_ip._cached = result.stdout.strip() if result.returncode == 0 else None
+        except Exception:
+            get_self_tailscale_ip._cached = None
+    return get_self_tailscale_ip._cached
+
+
+def get_reachable_ip(drone_ip: str) -> str:
+    """Return the best IP for a drone to reach us.
+
+    If the drone is on Tailscale (100.x.x.x), return our Tailscale IP.
+    Otherwise return our LAN IP.
+    """
+    self_ip = os.environ.get('REPORT_IP', get_self_ip())
+    if drone_ip and drone_ip.startswith('100.'):
+        ts_ip = get_self_tailscale_ip()
+        if ts_ip:
+            return ts_ip
+    return self_ip
 
 
 class V3Handler(BaseHTTPRequestHandler):
@@ -582,7 +609,7 @@ class V3Handler(BaseHTTPRequestHandler):
 
             # Preserve paused state
             node = db.get_node(node_id)
-            self_ip = os.environ.get('REPORT_IP', get_self_ip())
+            reachable = get_reachable_ip(ip)
 
             # Emit registration event (only for first-time or returning drones)
             prev_status = node.get('status') if node else None
@@ -593,7 +620,7 @@ class V3Handler(BaseHTTPRequestHandler):
 
             resp = {
                 'status': 'registered',
-                'orchestrator': self_ip,
+                'orchestrator': reachable,
                 'orchestrator_port': cfg.CONTROL_PLANE_PORT,
                 'orchestrator_name': 'build-swarm-v3',
             }
