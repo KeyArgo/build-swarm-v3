@@ -178,11 +178,21 @@ class V3Handler(BaseHTTPRequestHandler):
             nodes = db.get_all_nodes(include_offline=include_all)
             drones = [n for n in nodes if n['type'] in ('drone', 'sweeper')]
 
+            # Build assignment map from queue (delegated packages per drone)
+            assignment_map = {}
+            for p in db.get_delegated_packages():
+                did = p['assigned_to']
+                if did not in assignment_map:
+                    assignment_map[did] = []
+                assignment_map[did].append(p['package'])
+
             # Flatten metrics and add build stats for dashboard
             for d in drones:
                 m = d.get('metrics') or {}
                 d['cpu_percent'] = m.get('cpu_percent', 0)
                 d['ram_percent'] = m.get('ram_percent', 0)
+                # v3.2: Include CP-assigned packages (vs current_task which is emerge dep)
+                d['assigned_packages'] = assignment_map.get(d['id'], [])
                 # Build stats from history
                 stats = db.fetchone("""
                     SELECT
@@ -238,6 +248,14 @@ class V3Handler(BaseHTTPRequestHandler):
             session = db.get_active_session()
             drones = db.get_all_nodes(include_offline=True)
 
+            # Build assignment map from delegated packages
+            assign_map = {}
+            for p in db.get_delegated_packages():
+                did = p['assigned_to']
+                if did not in assign_map:
+                    assign_map[did] = []
+                assign_map[did].append(p['package'])
+
             # Build drone status map (keyed by name, not raw ID)
             drone_status = {}
             drone_health_map = {}
@@ -248,6 +266,7 @@ class V3Handler(BaseHTTPRequestHandler):
                     'ip': d['ip'],
                     'status': d['status'],
                     'current_task': d.get('current_task'),
+                    'assigned_packages': assign_map.get(d['id'], []),
                     'capabilities': d.get('capabilities', {}),
                     'metrics': d.get('metrics', {}),
                     'last_seen': d.get('last_seen'),
@@ -256,14 +275,13 @@ class V3Handler(BaseHTTPRequestHandler):
                 if h['failures'] > 0:
                     drone_health_map[dname] = h
 
-            # Build package lists for compatibility
+            # Build package lists for compatibility (reuse assign_map data)
             needed_pkgs = [p['package'] for p in db.get_needed_packages(limit=10)]
             delegated_pkgs = {}
-            for p in db.get_delegated_packages():
-                delegated_pkgs[p['package']] = {
-                    'drone': db.get_drone_name(p['assigned_to']),
-                    'assigned_at': p.get('assigned_at')
-                }
+            for did, pkgs in assign_map.items():
+                dname = db.get_drone_name(did)
+                for pkg in pkgs:
+                    delegated_pkgs[pkg] = {'drone': dname}
             blocked_pkgs = [p['package'] for p in db.get_blocked_packages()]
 
             # Timing metrics

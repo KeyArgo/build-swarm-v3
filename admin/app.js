@@ -148,6 +148,34 @@ function fmtPct(val) {
   return `${Math.round(val)}%`;
 }
 
+function formatDroneTask(node) {
+  const assigned = node.assigned_packages || [];
+  const emerging = node.current_task || '';
+  if (assigned.length === 0 && !emerging) {
+    return '<span style="color:var(--text-muted)">idle</span>';
+  }
+  let html = '';
+  if (assigned.length > 0) {
+    // Show first assigned package prominently, abbreviate category
+    const short = pkg => pkg.replace(/^[a-z]+-[a-z]+\//, m => m.split('/')[0].slice(0,3) + '/');
+    html += assigned.slice(0, 2).map(p =>
+      `<span style="color:var(--green)" title="${p}">${short(p)}</span>`
+    ).join(', ');
+    if (assigned.length > 2) html += ` <span style="color:var(--text-muted)">+${assigned.length - 2}</span>`;
+  }
+  if (emerging) {
+    // Show current emerge as secondary — dim if it differs from assigned (i.e. it's a dep)
+    const isDep = assigned.length > 0 && !assigned.includes(emerging);
+    if (assigned.length > 0) html += '<br>';
+    if (isDep) {
+      html += `<span style="color:var(--text-muted);font-size:0.65rem" title="compiling dependency">dep: ${emerging}</span>`;
+    } else if (assigned.length === 0) {
+      html += `<span title="emerge task">${emerging}</span>`;
+    }
+  }
+  return html;
+}
+
 // ── Connection status ──
 
 function setConnected(online) {
@@ -443,7 +471,7 @@ async function refreshFleet() {
           <td>${fmtPct(metrics.cpu_percent ?? n.cpu_percent)}</td>
           <td>${fmtPct(metrics.ram_percent ?? n.ram_percent)}</td>
           <td>${metrics.load_1m != null ? metrics.load_1m.toFixed(1) : '-'}</td>
-          <td class="mono" style="font-size:0.72rem;max-width:180px;overflow:hidden;text-overflow:ellipsis">${n.current_task || '<span style="color:var(--text-muted)">idle</span>'}</td>
+          <td class="mono" style="font-size:0.72rem;max-width:220px;overflow:hidden;text-overflow:ellipsis">${formatDroneTask(n)}</td>
           <td><span style="color:var(--green)">${n.builds_completed || 0}</span>/<span style="color:var(--red)">${n.builds_failed || 0}</span></td>
           <td>${n.version || '-'}</td>
           <td>
@@ -1356,10 +1384,13 @@ async function refreshTopology() {
     const x = startX + i * spacing;
     const online = d.status === 'online';
     const color = online ? '#06b6d4' : '#ef4444';
+    const ap = d.assigned_packages || [];
+    const task = ap.length > 0 ? ap[0].replace(/^[a-z]+-[a-z]+\//, m => m.split('/')[0].slice(0,3) + '/') : (d.current_task || '');
     svg += `<line x1="${W/2}" y1="60" x2="${x}" y2="${droneY}" stroke="${color}" stroke-width="0.5" opacity="0.3"/>`;
-    svg += `<rect x="${x-50}" y="${droneY}" width="100" height="35" class="node-box" fill="#0f172a" stroke="${color}" stroke-width="1"/>`;
+    svg += `<rect x="${x-55}" y="${droneY}" width="110" height="${task ? 48 : 35}" class="node-box" fill="#0f172a" stroke="${color}" stroke-width="1"/>`;
     svg += `<text x="${x}" y="${droneY+15}" text-anchor="middle" fill="${color}" font-weight="500">${d.name || id}</text>`;
     svg += `<text x="${x}" y="${droneY+27}" text-anchor="middle" class="label">${d.ip || ''}</text>`;
+    if (task) svg += `<text x="${x}" y="${droneY+40}" text-anchor="middle" style="font-size:8px" fill="${ap.length > 0 ? '#22c55e' : '#94a3b8'}">${task}</text>`;
   });
 
   if (drones.length === 0) {
