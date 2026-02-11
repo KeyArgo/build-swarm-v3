@@ -1059,101 +1059,497 @@ def cmd_bootstrap_script(args):
 
 
 def cmd_monitor(args):
-    """Simple live status display, refreshing every 5 seconds."""
+    """Full-screen curses TUI monitor for the build swarm."""
+    import curses
+    import threading
+
     interval = args.interval if hasattr(args, 'interval') and args.interval else 5
 
-    print(f'{C.DIM}Monitoring... (Ctrl+C to stop, refresh every {interval}s){C.RESET}')
+    # ── Non-fatal API fetcher (doesn't sys.exit on error) ──
 
-    try:
-        while True:
-            # Clear screen
-            print('\033[2J\033[H', end='')
+    def _api_fetch(path, params=None):
+        """Fetch from API without calling sys.exit on failure."""
+        url = f'{_resolve_url()}{path}'
+        if params:
+            query = '&'.join(f'{k}={v}' for k, v in params.items())
+            url = f'{url}?{query}'
+        try:
+            req = urllib.request.Request(url)
+            req.add_header('Accept', 'application/json')
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                return json.loads(resp.read().decode())
+        except Exception:
+            return None
 
-            now_str = datetime.now().strftime('%H:%M:%S')
-            print(f'{C.BOLD}{C.BCYAN}Build Swarm v3 Monitor{C.RESET}  '
-                  f'{C.DIM}{now_str}{C.RESET}')
-            print(f'{C.DIM}{"="*70}{C.RESET}')
+    # ── Color Constants ──
 
+    C_DEFAULT = 1
+    C_HEADER = 2
+    C_SUCCESS = 3
+    C_WARNING = 4
+    C_ERROR = 5
+    C_INFO = 6
+    C_DIM = 7
+
+    def init_colors():
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
             try:
-                data = api_get('/api/v1/status')
-            except SystemExit:
-                # api_get calls sys.exit on connection error — catch it here
-                print(f'\n{C.RED}Server unreachable. Retrying in {interval}s...{C.RESET}')
+                curses.init_pair(C_DEFAULT, -1, -1)
+                curses.init_pair(C_HEADER, curses.COLOR_BLACK, curses.COLOR_CYAN)
+                curses.init_pair(C_SUCCESS, curses.COLOR_GREEN, -1)
+                curses.init_pair(C_WARNING, curses.COLOR_YELLOW, -1)
+                curses.init_pair(C_ERROR, curses.COLOR_RED, -1)
+                curses.init_pair(C_INFO, curses.COLOR_CYAN, -1)
+                curses.init_pair(C_DIM, curses.COLOR_WHITE, -1)
+            except curses.error:
+                pass
+
+    # ── Thread-Safe State ──
+
+    class MonitorState:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.running = True
+            self.paused = False
+            self.view_mode = 'dashboard'
+            self.status = {}
+            self.events = []
+            self.last_event_id = 0
+            self.binhost = {'packages': 0, 'size_mb': 0}
+            self.connected = False
+            self.error_msg = None
+            self.last_update = None
+            self.auto_scroll = True
+            self.scroll_offset = 0
+            self.session_start = time.time()
+
+    # ── Background Fetcher ──
+
+    class MonitorFetcher(threading.Thread):
+        def __init__(self, state):
+            super().__init__(daemon=True)
+            self.state = state
+            self._binhost_tick = 0
+
+        def run(self):
+            while self.state.running:
+                if not self.state.paused:
+                    self._fetch()
                 time.sleep(interval)
-                continue
 
-            paused = data.get('paused', False)
-            if paused:
-                print(f'\n  {C.BOLD}{C.BYELLOW}*** PAUSED ***{C.RESET}')
+        def _fetch(self):
+            # Main status
+            data = _api_fetch('/api/v1/status')
+            if data:
+                with self.state.lock:
+                    self.state.status = data
+                    self.state.connected = True
+                    self.state.error_msg = None
+                    self.state.last_update = time.time()
+            else:
+                with self.state.lock:
+                    self.state.connected = False
+                    self.state.error_msg = 'Server unreachable'
 
-            # Queue bar
-            needed    = data.get('needed', 0)
-            delegated = data.get('delegated', 0)
-            received  = data.get('received', 0)
-            blocked   = data.get('blocked', 0)
-            failed    = data.get('failed', 0)
-            total     = data.get('total', 0)
+            # Events (incremental)
+            ev = _api_fetch('/api/v1/events', {'since': str(self.state.last_event_id)})
+            if ev and 'events' in ev:
+                with self.state.lock:
+                    for e in ev['events']:
+                        eid = e.get('id', 0)
+                        if eid > self.state.last_event_id:
+                            self.state.last_event_id = eid
+                        self.state.events.append(e)
+                    # Keep last 500
+                    if len(self.state.events) > 500:
+                        self.state.events = self.state.events[-500:]
 
-            print(f'\n  {C.BOLD}Queue:{C.RESET}')
-            print(f'    {C.YELLOW}Needed:    {needed:>5}{C.RESET}  '
-                  f'{C.BCYAN}Delegated: {delegated:>5}{C.RESET}  '
-                  f'{C.GREEN}Received:  {received:>5}{C.RESET}  '
-                  f'{C.RED}Blocked:   {blocked:>5}{C.RESET}')
+            # Binhost stats (every ~60s)
+            self._binhost_tick += 1
+            if self._binhost_tick >= max(1, 60 // interval):
+                self._binhost_tick = 0
+                bh = _api_fetch('/api/v1/binhost-stats')
+                if bh:
+                    with self.state.lock:
+                        self.state.binhost = bh
 
-            if total > 0:
-                pct = received / total * 100
-                bar_width = 50
-                filled = int(bar_width * received / total)
-                bar = f'{C.BGREEN}{"#" * filled}{C.DIM}{"." * (bar_width - filled)}{C.RESET}'
-                print(f'\n    [{bar}] {pct:.1f}%  ({received}/{total})')
+        def force_refresh(self):
+            threading.Thread(target=self._fetch, daemon=True).start()
 
-            # Drones
-            drones = data.get('drones', {})
-            if drones:
-                online = sum(1 for d in drones.values() if d.get('status') == 'online')
-                print(f'\n  {C.BOLD}Fleet:{C.RESET} '
-                      f'{C.BGREEN}{online}{C.RESET}/{len(drones)} online')
+    # ── Drawing Helpers ──
 
-                # Active builds
-                active = [(did, d) for did, d in drones.items() if d.get('current_task')]
-                idle = [(did, d) for did, d in drones.items()
-                        if d.get('status') == 'online' and not d.get('current_task')]
+    def safe_addstr(win, y, x, text, attr=0, max_x=None):
+        """Write string safely, handling curses edge-of-screen errors."""
+        h, w = win.getmaxyx()
+        if max_x is None:
+            max_x = w
+        if y < 0 or y >= h or x >= max_x:
+            return
+        text = str(text)[:max_x - x]
+        try:
+            win.addstr(y, x, text, attr)
+        except curses.error:
+            pass
 
-                if active:
-                    print(f'\n  {C.BOLD}Building:{C.RESET}')
-                    for did, d in active:
-                        name = d.get('name', did[:12])
-                        task = d.get('current_task', '-')
-                        metrics = d.get('metrics', {})
-                        cpu = metrics.get('cpu_percent')
-                        load = metrics.get('load_1m')
-                        extra = ''
-                        if cpu is not None:
-                            extra = f'  cpu:{cpu:.0f}%'
-                        if load is not None:
-                            extra += f'  load:{load:.1f}'
-                        print(f'    {C.BCYAN}{name:18s}{C.RESET} {task}'
-                              f'{C.DIM}{extra}{C.RESET}')
+    def draw_box(win, y, x, h, w, title=''):
+        """Draw a box with Unicode box-drawing characters."""
+        mh, mw = win.getmaxyx()
+        if y >= mh or x >= mw:
+            return
+        w = min(w, mw - x)
+        h = min(h, mh - y)
+        if h < 2 or w < 4:
+            return
+        # Top border
+        top = '╔═ ' + title + ' ' if title else '╔'
+        top += '═' * max(0, w - len(top) - 1) + '╗'
+        safe_addstr(win, y, x, top[:w], curses.color_pair(C_INFO))
+        # Sides
+        for row in range(1, h - 1):
+            if y + row < mh:
+                safe_addstr(win, y + row, x, '║', curses.color_pair(C_INFO))
+                if x + w - 1 < mw:
+                    safe_addstr(win, y + row, x + w - 1, '║', curses.color_pair(C_INFO))
+        # Bottom border
+        bot = '╚' + '═' * max(0, w - 2) + '╝'
+        safe_addstr(win, y + h - 1, x, bot[:w], curses.color_pair(C_INFO))
 
-                if idle:
-                    names = [d.get('name', did[:12]) for did, d in idle]
-                    print(f'\n  {C.DIM}Idle: {", ".join(names)}{C.RESET}')
+    def draw_bar(win, y, x, width, val, total):
+        """Draw a progress bar with block characters."""
+        if total == 0:
+            total = 1
+        pct = min(1.0, val / total)
+        filled = int(width * pct)
+        bar = '█' * filled + '░' * (width - filled)
+        safe_addstr(win, y, x, bar[:filled], curses.color_pair(C_SUCCESS))
+        safe_addstr(win, y, x + filled, bar[filled:], curses.color_pair(C_DIM))
 
-            # Timing
-            timing = data.get('timing', {})
-            if timing and timing.get('total_builds', 0) > 0:
-                rate = timing.get('success_rate', 0)
-                avg = fmt_duration(timing.get('avg_duration_s'))
-                total_t = fmt_duration(timing.get('total_duration_s'))
-                print(f'\n  {C.DIM}Stats: {timing["total_builds"]} builds, '
-                      f'{rate}% success, avg {avg}, total {total_t}{C.RESET}')
+    # ── Dashboard View ──
 
-            print(f'\n{C.DIM}Press Ctrl+C to exit{C.RESET}')
+    def draw_dashboard(stdscr, state):
+        h, w = stdscr.getmaxyx()
+        if h < 10 or w < 40:
+            safe_addstr(stdscr, 0, 0, 'Terminal too small', curses.color_pair(C_ERROR))
+            return
 
-            time.sleep(interval)
+        with state.lock:
+            data = dict(state.status)
+            events = list(state.events)
+            binhost = dict(state.binhost)
 
-    except KeyboardInterrupt:
-        print(f'\n{C.DIM}Monitor stopped.{C.RESET}')
+        version = data.get('version', '?')
+        nodes_on = data.get('nodes_online', 0)
+        nodes_total = data.get('nodes', 0)
+        total_cores = data.get('total_cores', 0)
+        paused = data.get('paused', False)
+        needed = data.get('needed', 0)
+        delegated = data.get('delegated', 0)
+        received = data.get('received', 0)
+        blocked = data.get('blocked', 0)
+        failed = data.get('failed', 0)
+        total = data.get('total', 0)
+        drones = data.get('drones', {})
+        timing = data.get('timing', {})
+        pkgs = data.get('packages', {})
+
+        # Layout
+        half_w = w // 2
+
+        # ── Row 0-2: Control Plane + Binhost ──
+        cp_w = half_w
+        bh_w = w - half_w
+
+        draw_box(stdscr, 0, 0, 4, cp_w, 'CONTROL PLANE')
+        cp_status = '● ' if state.connected else '○ '
+        cp_line1 = f'{cp_status}v{version}  {_resolve_url()}'
+        paused_str = '  [PAUSED]' if paused else ''
+        cp_line2 = f'{nodes_on}/{nodes_total} online, {total_cores} cores{paused_str}'
+        attr = curses.color_pair(C_SUCCESS) if state.connected else curses.color_pair(C_ERROR)
+        safe_addstr(stdscr, 1, 2, cp_line1, attr, cp_w - 1)
+        safe_addstr(stdscr, 2, 2, cp_line2, curses.color_pair(C_DEFAULT), cp_w - 1)
+
+        draw_box(stdscr, 0, half_w, 4, bh_w, 'BINHOST')
+        bh_pkgs = binhost.get('packages', 0)
+        bh_size = binhost.get('size_mb', 0)
+        if bh_size >= 1024:
+            bh_size_str = f'{bh_size/1024:.1f}G'
+        else:
+            bh_size_str = f'{bh_size}M'
+        safe_addstr(stdscr, 1, half_w + 2, f'Production: {bh_pkgs} pkgs  ({bh_size_str})',
+                    curses.color_pair(C_DEFAULT), w - 1)
+        success_rate = timing.get('success_rate', 0)
+        total_builds = timing.get('total_builds', 0)
+        safe_addstr(stdscr, 2, half_w + 2, f'Success: {success_rate}%  Builds: {total_builds}',
+                    curses.color_pair(C_DEFAULT), w - 1)
+
+        # ── Row 4-7: Build Progress ──
+        draw_box(stdscr, 4, 0, 5, w, 'BUILD PROGRESS')
+        bar_w = min(w - 30, 60)
+        if bar_w > 5 and total > 0:
+            pct = received / total * 100
+            draw_bar(stdscr, 5, 2, bar_w, received, total)
+            safe_addstr(stdscr, 5, bar_w + 3, f'{received}/{total} ({pct:.0f}%)',
+                        curses.color_pair(C_DEFAULT))
+        elif total == 0:
+            safe_addstr(stdscr, 5, 2, 'No active session — run: build-swarmv3 fresh',
+                        curses.color_pair(C_DIM))
+
+        stats_line = f'Needed: {needed}  |  Building: {delegated}  |  Complete: {received}  |  Blocked: {blocked}'
+        if failed:
+            stats_line += f'  |  Failed: {failed}'
+        safe_addstr(stdscr, 6, 2, stats_line, curses.color_pair(C_DEFAULT), w - 2)
+
+        # Rate + ETA
+        elapsed = time.time() - state.session_start
+        if received > 0 and elapsed > 10:
+            rate = received * 60 / elapsed
+            remaining = total - received
+            if rate > 0 and remaining > 0:
+                eta_s = remaining / (rate / 60)
+                eta_str = fmt_duration(eta_s)
+            elif remaining <= 0:
+                eta_str = 'complete'
+            else:
+                eta_str = '...'
+            safe_addstr(stdscr, 7, 2, f'Rate: {rate:.1f} pkg/min  |  ETA: {eta_str}',
+                        curses.color_pair(C_DIM), w - 2)
+
+        # ── Row 9+: Drones Table ──
+        drone_list = sorted(drones.items(), key=lambda kv: (
+            0 if kv[1].get('current_task') else 1,
+            0 if kv[1].get('status') == 'online' else 1,
+            kv[0]
+        ))
+        drone_h = min(len(drone_list) + 3, max(5, h - 21))
+        draw_box(stdscr, 9, 0, drone_h, w, 'DRONES (CPU% | RAM% | Load | Cores | Task)')
+
+        # Header row
+        hdr = f'{"Name":<16} {"IP":<18} {"CPU":>4} {"RAM":>4} {"Load":>5} {"Cores":>5}  {"Task"}'
+        safe_addstr(stdscr, 10, 2, hdr, curses.A_BOLD | curses.color_pair(C_DIM), w - 3)
+
+        for i, (dname, d) in enumerate(drone_list):
+            row = 11 + i
+            if row >= 9 + drone_h - 1:
+                break
+            m = d.get('metrics', {})
+            caps = d.get('capabilities', {})
+            task = d.get('current_task', '')
+            status = d.get('status', 'offline')
+            cpu = m.get('cpu_percent', 0)
+            ram = m.get('ram_percent', 0)
+            load = m.get('load_1m', 0)
+            cores = caps.get('cores', '?')
+            ip = d.get('ip', '?')
+
+            if status == 'online' and task:
+                dot = '●'
+                dot_color = curses.color_pair(C_SUCCESS)
+                # Shorten task: "sys-devel/gcc" → "gcc"
+                task_short = task.split('/')[-1] if '/' in task else task
+            elif status == 'online':
+                dot = '●'
+                dot_color = curses.color_pair(C_INFO)
+                task_short = '(idle)'
+            else:
+                dot = '○'
+                dot_color = curses.color_pair(C_DIM)
+                task_short = '(offline)'
+
+            safe_addstr(stdscr, row, 2, dot, dot_color)
+            line = f' {dname:<15} {ip:<18} {cpu:>3.0f}% {ram:>3.0f}% {load:>5.1f} {cores:>5}  {task_short}'
+            attr = curses.color_pair(C_DEFAULT) if status == 'online' else curses.color_pair(C_DIM)
+            safe_addstr(stdscr, row, 3, line, attr, w - 4)
+
+        # ── Bottom Panels: Active Assignments + Recent Events ──
+        bot_y = 9 + drone_h
+        remaining_h = h - bot_y - 1  # 1 for status bar
+        if remaining_h < 4:
+            return
+        panel_h = remaining_h
+        assign_w = half_w
+        events_w = w - half_w
+
+        draw_box(stdscr, bot_y, 0, panel_h, assign_w, 'ACTIVE ASSIGNMENTS')
+        del_pkgs = pkgs.get('delegated', {})
+        if isinstance(del_pkgs, dict):
+            for i, (pkg, info) in enumerate(del_pkgs.items()):
+                row = bot_y + 1 + i
+                if row >= bot_y + panel_h - 1:
+                    break
+                drone = info.get('drone', '?') if isinstance(info, dict) else str(info)
+                pkg_short = pkg.split('/')[-1] if '/' in pkg else pkg
+                drone_short = drone.replace('drone-', '') if drone.startswith('drone-') else drone
+                line = f'{pkg_short} → {drone_short}'
+                safe_addstr(stdscr, row, 2, line, curses.color_pair(C_INFO), assign_w - 3)
+        if not del_pkgs:
+            safe_addstr(stdscr, bot_y + 1, 2, '(none)', curses.color_pair(C_DIM))
+
+        draw_box(stdscr, bot_y, half_w, panel_h, events_w, 'RECENT EVENTS')
+        visible = panel_h - 2
+        recent = events[-visible:] if events else []
+        for i, ev in enumerate(recent):
+            row = bot_y + 1 + i
+            if row >= bot_y + panel_h - 1:
+                break
+            ts = ev.get('timestamp', 0)
+            ts_str = datetime.fromtimestamp(ts).strftime('%H:%M') if ts else '??:??'
+            msg = ev.get('message', '')[:events_w - 12]
+            etype = ev.get('type', '')
+
+            if etype in ('complete', 'recv'):
+                color = curses.color_pair(C_SUCCESS)
+            elif etype in ('fail', 'grounded'):
+                color = curses.color_pair(C_ERROR)
+            elif etype in ('assign', 'rebalance'):
+                color = curses.color_pair(C_INFO)
+            else:
+                color = curses.color_pair(C_DIM)
+
+            safe_addstr(stdscr, row, half_w + 2, f'[{ts_str}] {msg}', color, w - 1)
+
+    # ── Log View ──
+
+    def draw_log_view(stdscr, state):
+        h, w = stdscr.getmaxyx()
+        with state.lock:
+            events = list(state.events)
+
+        count = len(events)
+        title = f'EVENT LOG ({count} entries)'
+        if not state.auto_scroll:
+            title += ' [SCROLL LOCKED]'
+        safe_addstr(stdscr, 0, 0, f' {title} '.ljust(w),
+                    curses.color_pair(C_HEADER) | curses.A_BOLD)
+
+        visible = h - 2
+        if visible < 1:
+            return
+
+        if state.auto_scroll:
+            start = max(0, count - visible)
+        else:
+            start = max(0, min(state.scroll_offset, count - 1))
+        end = min(start + visible, count)
+
+        for i, idx in enumerate(range(start, end)):
+            row = 1 + i
+            if row >= h - 1:
+                break
+            ev = events[idx]
+            ts = ev.get('timestamp', 0)
+            ts_str = datetime.fromtimestamp(ts).strftime('%H:%M:%S') if ts else '??:??:??'
+            etype = ev.get('type', '?')
+            msg = ev.get('message', '')
+            line = f'[{ts_str}] [{etype:>10}] {msg}'
+
+            if etype in ('complete', 'recv'):
+                color = curses.color_pair(C_SUCCESS)
+            elif etype in ('fail', 'grounded', 'stale'):
+                color = curses.color_pair(C_ERROR)
+            elif etype in ('assign', 'rebalance'):
+                color = curses.color_pair(C_INFO)
+            elif etype in ('register', 'offline'):
+                color = curses.color_pair(C_WARNING)
+            else:
+                color = curses.color_pair(C_DEFAULT)
+
+            safe_addstr(stdscr, row, 0, line[:w - 1], color)
+
+    # ── Status Bar ──
+
+    def draw_statusbar(stdscr, state):
+        h, w = stdscr.getmaxyx()
+        row = h - 1
+
+        if state.view_mode == 'dashboard':
+            keys = '[q]uit [l]ogs [r]efresh [p]ause'
+        else:
+            keys = '[q]uit [d]ashboard [↑↓]scroll [End]follow'
+
+        paused_str = ' [PAUSED]' if state.paused else ''
+        if state.last_update:
+            ts = datetime.fromtimestamp(state.last_update).strftime('%H:%M:%S')
+        else:
+            ts = '--:--:--'
+
+        if state.error_msg:
+            right = f'  {state.error_msg}  '
+            attr = curses.color_pair(C_ERROR)
+        else:
+            right = f'  Updated: {ts}{paused_str}  '
+            attr = curses.color_pair(C_DIM)
+
+        line = f' {keys}'.ljust(w - len(right)) + right
+        safe_addstr(stdscr, row, 0, line[:w], attr)
+
+    # ── Main Curses Loop ──
+
+    def _monitor_main(stdscr):
+        init_colors()
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+        stdscr.timeout(100)
+
+        state = MonitorState()
+        fetcher = MonitorFetcher(state)
+        fetcher.start()
+
+        while True:
+            try:
+                ch = stdscr.getch()
+                if ch == ord('q') or ch == ord('Q'):
+                    break
+                elif ch == ord('p') or ch == ord('P'):
+                    state.paused = not state.paused
+                elif ch == ord('r') or ch == ord('R'):
+                    fetcher.force_refresh()
+                elif ch == ord('l') or ch == ord('L'):
+                    state.view_mode = 'log'
+                elif ch == ord('d') or ch == ord('D'):
+                    state.view_mode = 'dashboard'
+
+                # Scroll in log mode
+                if state.view_mode == 'log':
+                    if ch == curses.KEY_UP:
+                        if state.auto_scroll:
+                            with state.lock:
+                                state.scroll_offset = max(0, len(state.events) - (curses.LINES - 2))
+                        state.auto_scroll = False
+                        state.scroll_offset = max(0, state.scroll_offset - 1)
+                    elif ch == curses.KEY_DOWN:
+                        state.scroll_offset += 1
+                        with state.lock:
+                            if state.scroll_offset >= len(state.events) - (curses.LINES - 2):
+                                state.auto_scroll = True
+                    elif ch == curses.KEY_PPAGE:
+                        state.auto_scroll = False
+                        state.scroll_offset = max(0, state.scroll_offset - 10)
+                    elif ch == curses.KEY_NPAGE:
+                        state.scroll_offset += 10
+                    elif ch == curses.KEY_END:
+                        state.auto_scroll = True
+
+                stdscr.erase()
+
+                if state.view_mode == 'dashboard':
+                    draw_dashboard(stdscr, state)
+                else:
+                    draw_log_view(stdscr, state)
+
+                draw_statusbar(stdscr, state)
+                stdscr.refresh()
+                time.sleep(0.05)
+
+            except KeyboardInterrupt:
+                break
+            except curses.error:
+                pass
+
+        state.running = False
+
+    curses.wrapper(_monitor_main)
 
 
 # ── Argument Parser ──────────────────────────────────────────────────────────

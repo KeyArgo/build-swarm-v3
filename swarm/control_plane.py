@@ -448,6 +448,21 @@ class V3Handler(BaseHTTPRequestHandler):
                 })
             self.send_json({'drones': result})
 
+        # ── Binhost Stats (v3.1) ──
+        elif path == '/api/v1/binhost-stats':
+            global _binhost_cache
+            now = time.time()
+            if now - _binhost_cache.get('ts', 0) > 60:
+                import glob as _glob
+                staging = cfg.BINHOST_PRIMARY_PATH or '/var/cache/binpkgs'
+                pkgs = _glob.glob(os.path.join(staging, '**/*.gpkg.tar'), recursive=True)
+                total_size = sum(os.path.getsize(p) for p in pkgs if os.path.exists(p))
+                _binhost_cache = {
+                    'ts': now,
+                    'data': {'packages': len(pkgs), 'size_mb': round(total_size / 1048576)}
+                }
+            self.send_json(_binhost_cache['data'])
+
         # ── Build Stats by Package (v3.1) ──
         elif path == '/api/v1/build-stats/by-package':
             rows = db.fetchall("""
@@ -963,6 +978,7 @@ def _validate_binary(package: str) -> bool:
 # ── Background Threads ────────────────────────────────────────────
 
 _start_time = time.time()
+_binhost_cache = {'ts': 0, 'data': {'packages': 0, 'size_mb': 0}}
 
 
 def _metrics_recorder():
