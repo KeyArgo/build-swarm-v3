@@ -244,7 +244,7 @@ async function refresh() {
   const tab = active.id.replace('tab-', '');
 
   if (tab === 'fleet') await refreshFleet();
-  else if (tab === 'drone-mgmt') await refreshDroneConfigs();
+  else if (tab === 'drone-mgmt') { await refreshDroneConfigs(); await refreshAllowlist(); populateAuditDroneSelect(window._lastV3Nodes); }
   else if (tab === 'binhost') await refreshBinhost();
   else if (tab === 'queue') await refreshQueue();
   else if (tab === 'history') await refreshHistory();
@@ -382,6 +382,7 @@ async function refreshFleet() {
   ]);
 
   const v3List = Array.isArray(v3Nodes) ? v3Nodes : [];
+  window._lastV3Nodes = v3List;  // Cache for audit drone selector
   const v2Drones = v2Data?.drones || [];
   const v2Orchestrators = v2Data?.orchestrators || [];
   const v2All = [...v2Drones, ...v2Orchestrators];
@@ -728,6 +729,148 @@ async function addNewDroneConfig() {
     input.value = '';
     await refreshDroneConfigs();
     editDroneConfig(name);
+  }
+}
+
+// ── Allowlist + Bloat Audit ──
+
+async function refreshAllowlist() {
+  const data = await adminGet('/drones/allowlist');
+  const tbody = $('#allowlist-tbody');
+  if (!tbody || !data) return;
+
+  const entries = data.allowlist || [];
+  if (entries.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="4" class="empty-state">No allowlist entries.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = entries.map(e => {
+    const scope = e.drone_id || 'global';
+    const scopeColor = scope === 'global' ? 'var(--cyan)' : 'var(--green)';
+    return `<tr>
+      <td><code>${esc(e.package)}</code></td>
+      <td><span style="color:${scopeColor}">${esc(scope)}</span></td>
+      <td style="color:var(--text-dim)">${esc(e.reason || '-')}</td>
+      <td><button class="btn danger" style="padding:0.2rem 0.5rem;font-size:0.7rem" onclick="removeAllowlistEntry(${e.id})" title="Remove">Del</button></td>
+    </tr>`;
+  }).join('');
+}
+
+async function addAllowlistEntry() {
+  const pkg = $('#al-package')?.value.trim();
+  if (!pkg) return;
+  const drone = $('#al-drone')?.value.trim() || null;
+  const reason = $('#al-reason')?.value.trim() || null;
+
+  const result = await adminPost('/drones/allowlist', {
+    package: pkg,
+    drone,
+    reason,
+    added_by: 'admin-panel',
+  });
+  if (result && result.status === 'ok') {
+    $('#al-package').value = '';
+    $('#al-drone').value = '';
+    $('#al-reason').value = '';
+    await refreshAllowlist();
+  }
+}
+
+async function removeAllowlistEntry(id) {
+  const result = await fetch(`${ADMIN_API}/drones/allowlist/${id}`, {
+    method: 'DELETE',
+    headers: { 'X-Admin-Key': adminKey },
+  }).then(r => r.json()).catch(() => null);
+
+  if (result && result.status === 'ok') {
+    await refreshAllowlist();
+  }
+}
+
+async function populateAuditDroneSelect(nodes) {
+  const sel = $('#audit-drone-select');
+  if (!sel) return;
+  // If no nodes passed, fetch them
+  if (!nodes || nodes.length === 0) {
+    nodes = await v3Get('/nodes?all=true');
+    if (Array.isArray(nodes)) window._lastV3Nodes = nodes;
+  }
+  const current = sel.value;
+  // Keep first option
+  while (sel.options.length > 1) sel.remove(1);
+  const drones = (nodes || []).filter(n => n.type === 'drone');
+  for (const d of drones) {
+    const opt = document.createElement('option');
+    opt.value = d.name;
+    opt.textContent = `${d.name} (${d.ip || d.tailscale_ip || '?'})`;
+    sel.appendChild(opt);
+  }
+  if (current) sel.value = current;
+}
+
+async function runBloatAudit() {
+  const name = $('#audit-drone-select')?.value;
+  if (!name) return;
+
+  const resultDiv = $('#audit-result');
+  resultDiv.style.display = 'none';
+  $('#audit-details').innerHTML = '<span style="color:var(--text-dim)">Auditing via SSH...</span>';
+  resultDiv.style.display = 'block';
+
+  const data = await adminGet(`/drones/${encodeURIComponent(name)}/audit`);
+  if (!data || data.error) {
+    $('#audit-details').innerHTML = `<span class="red">${esc(data?.error || 'Failed')}</span>`;
+    return;
+  }
+
+  const clean = data.clean;
+  $('#audit-status').textContent = clean ? 'CLEAN' : 'BLOATED';
+  $('#audit-status').style.color = clean ? 'var(--green)' : 'var(--red)';
+  $('#audit-total').textContent = data.total_installed;
+  $('#audit-world').textContent = data.world_count;
+  $('#audit-excess').textContent = data.excess_count;
+  $('#audit-excess').style.color = data.excess_count > 0 ? 'var(--red)' : 'var(--green)';
+
+  const cleanBtn = $('#clean-btn');
+  if (cleanBtn) cleanBtn.style.display = data.excess_count > 0 ? 'inline-block' : 'none';
+
+  let html = `<div style="margin-bottom:0.5rem;font-size:0.85rem">
+    <strong>Profile:</strong> <code>${esc(data.profile)}</code>
+    ${data.is_base_profile ? '<span style="color:var(--green)">(base)</span>' : '<span style="color:var(--red)">(non-base!)</span>'}
+  </div>`;
+
+  if (data.excess && data.excess.length > 0) {
+    html += `<div style="margin-top:0.75rem"><strong class="red">Excess packages (${data.excess.length}):</strong>
+      <div style="max-height:200px;overflow-y:auto;margin-top:0.25rem;padding:0.5rem;background:var(--surface);border-radius:4px">
+      ${data.excess.map(p => `<div><code style="color:var(--red)">${esc(p)}</code></div>`).join('')}
+      </div></div>`;
+  }
+  if (data.missing && data.missing.length > 0) {
+    html += `<div style="margin-top:0.75rem"><strong class="yellow">Missing packages (${data.missing.length}):</strong>
+      <div style="max-height:200px;overflow-y:auto;margin-top:0.25rem;padding:0.5rem;background:var(--surface);border-radius:4px">
+      ${data.missing.map(p => `<div><code style="color:var(--yellow)">${esc(p)}</code></div>`).join('')}
+      </div></div>`;
+  }
+
+  $('#audit-details').innerHTML = html;
+}
+
+async function runDroneClean() {
+  const name = $('#audit-drone-select')?.value;
+  if (!name) return;
+  if (!confirm(`Clean drone "${name}"?\n\nThis will:\n1. Write minimal @world from allowlist\n2. Switch to base profile\n3. Run emerge --depclean in background`)) return;
+
+  const result = await adminPost(`/drones/${encodeURIComponent(name)}/clean`, {});
+  if (result && !result.error) {
+    const steps = result.steps || [];
+    $('#audit-details').innerHTML = `<div style="margin-top:0.5rem;color:var(--green)">
+      <strong>Clean started:</strong>
+      ${steps.map(s => `<div style="margin-left:1rem">${esc(s)}</div>`).join('')}
+    </div>`;
+    $('#clean-btn').style.display = 'none';
+  } else {
+    $('#audit-details').innerHTML += `<div style="margin-top:0.5rem;color:var(--red)">Clean failed: ${esc(result?.error || 'Unknown')}</div>`;
   }
 }
 

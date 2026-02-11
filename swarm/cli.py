@@ -807,8 +807,20 @@ def cmd_drone(args):
         _drone_deploy(args)
     elif drone_cmd == 'create':
         _drone_create(args)
+    elif drone_cmd == 'packages':
+        _drone_packages(args)
+    elif drone_cmd == 'allowlist':
+        _drone_allowlist(args)
+    elif drone_cmd == 'allow':
+        _drone_allow(args)
+    elif drone_cmd == 'deny':
+        _drone_deny(args)
+    elif drone_cmd == 'clean':
+        _drone_clean(args)
+    elif drone_cmd == 'bloat-audit':
+        _drone_bloat_audit(args)
     else:
-        print(f'{C.RED}Error:{C.RESET} Specify a drone sub-command: audit, deploy, create')
+        print(f'{C.RED}Error:{C.RESET} Specify a drone sub-command: audit, deploy, create, packages, allowlist, allow, deny, clean, bloat-audit')
         sys.exit(1)
 
 
@@ -1118,6 +1130,176 @@ def _drone_create(args):
         sys.exit(1)
 
     print()
+
+
+def _drone_packages(args):
+    """Show installed packages on a drone."""
+    name = args.drone_name
+    print(f'{C.DIM}Querying {name} via admin API...{C.RESET}')
+    data = admin_get(f'/admin/api/drones/{name}/packages')
+    if not data or data.get('error'):
+        print(f'{C.RED}Error:{C.RESET} {data.get("error", "Unknown error") if data else "No response"}')
+        sys.exit(1)
+
+    print_header(f'Packages on {name}')
+    print_kv('IP', data.get('ip', '-'))
+    print_kv('Profile', data.get('profile', 'unknown'))
+    print_kv('Installed', data.get('installed_count', 0))
+    print_kv('World', data.get('world_count', 0))
+
+    if data.get('world'):
+        print(f'\n  {C.BOLD}@world ({len(data["world"])}):{C.RESET}')
+        for pkg in sorted(data['world']):
+            print(f'    {pkg}')
+
+
+def _drone_allowlist(args):
+    """Show the drone package allowlist."""
+    drone = args.drone_name if hasattr(args, 'drone_name') and args.drone_name else None
+    params = {'drone': drone} if drone else {}
+    data = admin_get('/admin/api/drones/allowlist', params)
+    if not data or data.get('error'):
+        print(f'{C.RED}Error:{C.RESET} {data.get("error", "Unknown error") if data else "No response"}')
+        sys.exit(1)
+
+    entries = data.get('allowlist', [])
+    title = f'Allowlist for {drone}' if drone else 'Global Allowlist'
+    print_header(title)
+
+    if not entries:
+        print(f'  {C.DIM}No entries.{C.RESET}')
+        return
+
+    print(f'  {C.BOLD}{"ID":<6} {"Scope":<15} {"Package":<35} {"Reason":<20}{C.RESET}')
+    print(f'  {"─" * 78}')
+    for e in entries:
+        scope = e.get('drone_id') or 'global'
+        reason = e.get('reason') or '-'
+        color = C.CYAN if scope == 'global' else C.GREEN
+        print(f'  {e["id"]:<6} {color}{scope:<15}{C.RESET} {e["package"]:<35} {C.DIM}{reason:<20}{C.RESET}')
+
+
+def _drone_allow(args):
+    """Add a package to the allowlist."""
+    data = {
+        'package': args.package,
+        'added_by': 'cli',
+    }
+    if hasattr(args, 'drone') and args.drone:
+        data['drone'] = args.drone
+    if hasattr(args, 'reason') and args.reason:
+        data['reason'] = args.reason
+
+    result = admin_post('/admin/api/drones/allowlist', data)
+    if result and result.get('status') == 'ok':
+        scope = data.get('drone', 'global')
+        print(f'{C.BGREEN}Allowed:{C.RESET} {args.package} (scope: {scope}, id: {result.get("id")})')
+    else:
+        print(f'{C.RED}Error:{C.RESET} {result.get("error", "Unknown error") if result else "No response"}')
+        sys.exit(1)
+
+
+def _drone_deny(args):
+    """Remove a package from the allowlist."""
+    # First, find the entry by package name
+    data = admin_get('/admin/api/drones/allowlist')
+    if not data:
+        print(f'{C.RED}Error:{C.RESET} No response from admin API')
+        sys.exit(1)
+
+    entries = data.get('allowlist', [])
+    matches = [e for e in entries if e['package'] == args.package]
+
+    if not matches:
+        print(f'{C.RED}Error:{C.RESET} Package "{args.package}" not found in allowlist')
+        sys.exit(1)
+
+    for entry in matches:
+        result = admin_delete(f'/admin/api/drones/allowlist/{entry["id"]}')
+        scope = entry.get('drone_id') or 'global'
+        if result and result.get('status') == 'ok':
+            print(f'{C.BRED}Removed:{C.RESET} {args.package} (scope: {scope}, id: {entry["id"]})')
+        else:
+            print(f'{C.RED}Error:{C.RESET} Failed to remove id {entry["id"]}')
+
+
+def _drone_clean(args):
+    """Clean a drone: switch to base profile, write minimal @world, depclean."""
+    name = args.drone_name
+    dry_run = args.dry_run if hasattr(args, 'dry_run') else False
+
+    if not dry_run:
+        print(f'{C.YELLOW}WARNING:{C.RESET} This will:')
+        print(f'  1. Write a minimal @world from the allowlist')
+        print(f'  2. Switch to base profile (default/linux/amd64/23.0)')
+        print(f'  3. Run emerge --depclean in background')
+        print()
+        try:
+            answer = input(f'  Clean drone {C.BOLD}{name}{C.RESET}? [y/N] ')
+        except (KeyboardInterrupt, EOFError):
+            print(f'\n{C.DIM}Aborted.{C.RESET}')
+            return
+        if answer.lower() != 'y':
+            print(f'{C.DIM}Aborted.{C.RESET}')
+            return
+
+    data = {'dry_run': dry_run}
+    print(f'{C.DIM}Cleaning {name}...{C.RESET}')
+    result = admin_post(f'/admin/api/drones/{name}/clean', data)
+
+    if not result:
+        print(f'{C.RED}Error:{C.RESET} No response from admin API')
+        sys.exit(1)
+
+    if result.get('error'):
+        print(f'{C.RED}Error:{C.RESET} {result["error"]}')
+        sys.exit(1)
+
+    status = result.get('status', 'unknown')
+    print_header(f'Clean {name} ({status})')
+
+    for step in result.get('steps', []):
+        print(f'  {C.GREEN}✓{C.RESET} {step}')
+
+    if result.get('world_packages'):
+        print(f'\n  {C.BOLD}@world ({len(result["world_packages"])}):{C.RESET}')
+        for pkg in result['world_packages']:
+            print(f'    {pkg}')
+
+
+def _drone_bloat_audit(args):
+    """Audit a drone's installed packages against the allowlist."""
+    name = args.drone_name
+    print(f'{C.DIM}Auditing {name}...{C.RESET}')
+    data = admin_get(f'/admin/api/drones/{name}/audit')
+    if not data or data.get('error'):
+        print(f'{C.RED}Error:{C.RESET} {data.get("error", "Unknown error") if data else "No response"}')
+        sys.exit(1)
+
+    clean = data.get('clean', False)
+    status_str = f'{C.BGREEN}CLEAN{C.RESET}' if clean else f'{C.BRED}BLOATED{C.RESET}'
+
+    print_header(f'Bloat Audit: {name}')
+    print_kv('Status', status_str)
+    print_kv('IP', data.get('ip', '-'))
+    print_kv('Profile', data.get('profile', 'unknown'))
+    base = data.get('is_base_profile', False)
+    print_kv('Base Profile', f'{C.BGREEN}yes{C.RESET}' if base else f'{C.BRED}no{C.RESET}')
+    print_kv('Total Installed', data.get('total_installed', 0))
+    print_kv('World', data.get('world_count', 0))
+    print_kv('Allowed', data.get('allowed_count', 0))
+    print_kv('Excess', data.get('excess_count', 0), C.BRED if data.get('excess_count', 0) > 0 else C.BGREEN)
+    print_kv('Missing', data.get('missing_count', 0), C.BYELLOW if data.get('missing_count', 0) > 0 else C.BGREEN)
+
+    if data.get('excess'):
+        print(f'\n  {C.BRED}Excess packages (in @world, not in allowlist):{C.RESET}')
+        for pkg in data['excess']:
+            print(f'    {C.RED}✗{C.RESET} {pkg}')
+
+    if data.get('missing'):
+        print(f'\n  {C.BYELLOW}Missing packages (in allowlist, not in @world):{C.RESET}')
+        for pkg in data['missing']:
+            print(f'    {C.YELLOW}?{C.RESET} {pkg}')
 
 
 def cmd_bootstrap_script(args):
@@ -1959,6 +2141,39 @@ Environment:
                           help='Show what would happen without doing it')
     p_create.add_argument('--list-backends', action='store_true',
                           help='List available backends and exit')
+
+    # drone packages
+    p_dpkg = drone_sub.add_parser('packages', help='List installed packages on a drone')
+    p_dpkg.add_argument('drone_name', help='Drone name (e.g., Imai)')
+
+    # drone allowlist
+    p_dal = drone_sub.add_parser('allowlist', help='Show the package allowlist')
+    p_dal.add_argument('drone_name', nargs='?', default=None,
+                       help='Drone name to filter (default: show all)')
+
+    # drone allow
+    p_dallow = drone_sub.add_parser('allow', help='Add a package to the allowlist')
+    p_dallow.add_argument('package', help='Package atom (e.g., net-misc/openssh)')
+    p_dallow.add_argument('--drone', type=str, default=None,
+                          help='Drone name for per-drone allowance (default: global)')
+    p_dallow.add_argument('--reason', type=str, default=None,
+                          help='Reason for allowing this package')
+
+    # drone deny
+    p_ddeny = drone_sub.add_parser('deny', help='Remove a package from the allowlist')
+    p_ddeny.add_argument('package', help='Package atom to remove')
+
+    # drone clean
+    p_dclean = drone_sub.add_parser('clean',
+                                     help='Clean a drone: switch to base profile + depclean')
+    p_dclean.add_argument('drone_name', help='Drone name to clean')
+    p_dclean.add_argument('--dry-run', action='store_true',
+                          help='Show what would be done without doing it')
+
+    # drone bloat-audit
+    p_dbaudit = drone_sub.add_parser('bloat-audit',
+                                      help='Audit drone packages against allowlist')
+    p_dbaudit.add_argument('drone_name', help='Drone name to audit')
 
     # release
     p_release = sub.add_parser('release', help='Manage binary package releases')

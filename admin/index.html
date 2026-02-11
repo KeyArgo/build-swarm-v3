@@ -427,6 +427,72 @@
         <button class="btn success" onclick="addNewDroneConfig()">Add</button>
       </div>
     </div>
+
+    <!-- Drone Package Allowlist -->
+    <div class="section-card">
+      <h3>Package Allowlist</h3>
+      <p style="color:var(--text-dim);font-size:0.8rem;margin-bottom:1rem">
+        Controls which packages are permitted in @world on build drones.
+        Global entries apply to all drones; per-drone entries override for specific machines.
+      </p>
+      <div class="table-wrap" style="max-height:350px;overflow-y:auto">
+        <table>
+          <thead>
+            <tr>
+              <th>Package</th>
+              <th>Scope</th>
+              <th>Reason</th>
+              <th style="width:60px">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="allowlist-tbody">
+            <tr><td colspan="4" class="empty-state">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div style="display:flex;gap:0.75rem;align-items:center;margin-top:1rem">
+        <input type="text" id="al-package" placeholder="cat/package (e.g. net-misc/curl)" style="flex:2;padding:0.5rem;background:var(--surface);border:1px solid var(--border);color:var(--text);border-radius:4px">
+        <input type="text" id="al-drone" placeholder="drone (blank=global)" style="flex:1;padding:0.5rem;background:var(--surface);border:1px solid var(--border);color:var(--text);border-radius:4px">
+        <input type="text" id="al-reason" placeholder="reason" style="flex:1;padding:0.5rem;background:var(--surface);border:1px solid var(--border);color:var(--text);border-radius:4px">
+        <button class="btn success" onclick="addAllowlistEntry()">Add</button>
+      </div>
+    </div>
+
+    <!-- Drone Bloat Audit -->
+    <div class="section-card">
+      <h3>Bloat Audit</h3>
+      <p style="color:var(--text-dim);font-size:0.8rem;margin-bottom:1rem">
+        Check drones for excess packages beyond the allowlist. Select a drone to audit.
+      </p>
+      <div style="display:flex;gap:0.75rem;align-items:center;margin-bottom:1rem">
+        <select id="audit-drone-select" style="flex:1;padding:0.5rem;background:var(--surface);border:1px solid var(--border);color:var(--text);border-radius:4px">
+          <option value="">Select drone...</option>
+        </select>
+        <button class="btn" onclick="runBloatAudit()">Audit</button>
+        <button class="btn danger" onclick="runDroneClean()" id="clean-btn" style="display:none">Clean</button>
+      </div>
+      <div id="audit-result" style="display:none">
+        <div class="cards-row" style="margin-bottom:1rem">
+          <div class="stat-card" id="audit-status-card">
+            <div class="label">Status</div>
+            <div class="value" id="audit-status">-</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">Total Installed</div>
+            <div class="value" id="audit-total">-</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">@world</div>
+            <div class="value" id="audit-world">-</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">Excess</div>
+            <div class="value" id="audit-excess">-</div>
+          </div>
+        </div>
+        <div id="audit-details"></div>
+      </div>
+    </div>
   </div>
 
   <!-- ═══════════════════ BINHOST TAB ═══════════════════ -->

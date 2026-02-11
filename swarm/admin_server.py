@@ -265,6 +265,24 @@ class AdminHandler(BaseHTTPRequestHandler):
                 self.send_error_json(500, 'Database not available')
             return
 
+        # Allowlist deletion
+        if path.startswith('/admin/api/drones/allowlist/'):
+            entry_id = path.split('/')[-1]
+            try:
+                entry_id = int(entry_id)
+            except (ValueError, TypeError):
+                self.send_error_json(400, 'Invalid allowlist entry ID')
+                return
+            if cp.db:
+                ok = cp.db.remove_allowlist(entry_id)
+                if ok:
+                    self.send_json({'status': 'ok', 'deleted': entry_id})
+                else:
+                    self.send_error_json(404, f'Allowlist entry {entry_id} not found')
+            else:
+                self.send_error_json(500, 'Database not available')
+            return
+
         # Release deletion
         if path.startswith('/admin/api/releases/'):
             version = path.split('/')[-1]
@@ -403,6 +421,27 @@ class AdminHandler(BaseHTTPRequestHandler):
                 self.send_error_json(500, 'Release manager not available')
             return
 
+        # ── Drone Allowlist ──
+
+        if path == '/admin/api/drones/allowlist':
+            if cp.db:
+                drone = params.get('drone', [None])[0]
+                entries = cp.db.get_allowlist(drone)
+                self.send_json({'allowlist': entries})
+            else:
+                self.send_error_json(500, 'Database not available')
+            return
+
+        if path.startswith('/admin/api/drones/') and path.endswith('/packages'):
+            drone_name = path.split('/')[4]
+            self._handle_drone_packages(cp, drone_name)
+            return
+
+        if path.startswith('/admin/api/drones/') and path.endswith('/audit'):
+            drone_name = path.split('/')[4]
+            self._handle_drone_audit(cp, drone_name)
+            return
+
         # V2 proxy (GET endpoints)
         if path == '/admin/api/v2/nodes':
             self._proxy_v2('/api/v1/nodes?all=true')
@@ -534,6 +573,30 @@ class AdminHandler(BaseHTTPRequestHandler):
                 self.send_error_json(500, 'Release manager not available')
             return
 
+        # ── Drone Allowlist + Clean ──
+
+        if path == '/admin/api/drones/allowlist':
+            package = body.get('package')
+            if not package:
+                self.send_error_json(400, 'Missing "package"')
+                return
+            if cp.db:
+                entry_id = cp.db.add_allowlist(
+                    package=package,
+                    drone_name=body.get('drone'),
+                    reason=body.get('reason'),
+                    added_by=body.get('added_by', 'admin'),
+                )
+                self.send_json({'status': 'ok', 'id': entry_id, 'package': package})
+            else:
+                self.send_error_json(500, 'Database not available')
+            return
+
+        if path.startswith('/admin/api/drones/') and path.endswith('/clean'):
+            drone_name = path.split('/')[4]
+            self._handle_drone_clean(cp, drone_name, body)
+            return
+
         # Binhost stubs (Phase 5)
         if path == '/admin/api/binhost/flip':
             self.send_json({'status': 'not_implemented', 'message': 'Binhost flip — Phase 5'})
@@ -544,6 +607,184 @@ class AdminHandler(BaseHTTPRequestHandler):
             return
 
         self.send_error_json(404, f'Unknown admin endpoint: {path}')
+
+
+    # ── Drone management helpers ────────────────────────────────────
+
+    def _handle_drone_packages(self, cp, drone_name: str):
+        """List installed packages on a drone via SSH."""
+        node = cp.db.get_node_by_name(drone_name) if cp.db else None
+        if not node:
+            self.send_error_json(404, f'Drone not found: {drone_name}')
+            return
+
+        ip = node.get('ip')
+        if not ip:
+            self.send_error_json(400, f'No IP for drone {drone_name}')
+            return
+
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
+                 f'root@{ip}',
+                 'ls -d /var/db/pkg/*/* 2>/dev/null | '
+                 'sed "s|/var/db/pkg/||" | sort'],
+                capture_output=True, text=True, timeout=15)
+            packages = [p.strip() for p in result.stdout.strip().split('\n') if p.strip()]
+
+            # Also get @world and profile
+            result2 = subprocess.run(
+                ['ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
+                 f'root@{ip}',
+                 'cat /var/lib/portage/world 2>/dev/null; '
+                 'echo "---PROFILE---"; '
+                 'eselect profile show 2>/dev/null | tail -1'],
+                capture_output=True, text=True, timeout=15)
+
+            parts = result2.stdout.split('---PROFILE---')
+            world = [w.strip() for w in parts[0].strip().split('\n') if w.strip()] if parts else []
+            profile = parts[1].strip() if len(parts) > 1 else 'unknown'
+
+            self.send_json({
+                'drone': drone_name,
+                'ip': ip,
+                'installed_count': len(packages),
+                'installed': packages,
+                'world_count': len(world),
+                'world': world,
+                'profile': profile,
+            })
+        except Exception as e:
+            self.send_error_json(500, f'SSH failed: {e}')
+
+    def _handle_drone_audit(self, cp, drone_name: str):
+        """Audit a drone: compare installed packages against allowlist."""
+        node = cp.db.get_node_by_name(drone_name) if cp.db else None
+        if not node:
+            self.send_error_json(404, f'Drone not found: {drone_name}')
+            return
+
+        ip = node.get('ip')
+        if not ip:
+            self.send_error_json(400, f'No IP for drone {drone_name}')
+            return
+
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
+                 f'root@{ip}',
+                 'cat /var/lib/portage/world 2>/dev/null; '
+                 'echo "---PROFILE---"; '
+                 'eselect profile show 2>/dev/null | tail -1; '
+                 'echo "---COUNT---"; '
+                 'ls -d /var/db/pkg/*/* 2>/dev/null | wc -l'],
+                capture_output=True, text=True, timeout=15)
+
+            parts = result.stdout.split('---PROFILE---')
+            world = [w.strip() for w in parts[0].strip().split('\n') if w.strip()] if parts else []
+
+            profile_and_count = parts[1].split('---COUNT---') if len(parts) > 1 else ['unknown', '0']
+            profile = profile_and_count[0].strip()
+            total_count = int(profile_and_count[1].strip()) if len(profile_and_count) > 1 else 0
+
+            # Get allowlist
+            allowed = cp.db.get_allowlist_packages(drone_name)
+
+            # Compute excess (in @world but not in allowlist)
+            excess = sorted(set(world) - allowed)
+            # Missing (in allowlist but not in @world)
+            missing = sorted(allowed - set(world))
+
+            # Profile check
+            is_base_profile = 'desktop' not in profile and 'gnome' not in profile
+
+            self.send_json({
+                'drone': drone_name,
+                'ip': ip,
+                'total_installed': total_count,
+                'world_count': len(world),
+                'world': world,
+                'profile': profile,
+                'is_base_profile': is_base_profile,
+                'allowed_count': len(allowed),
+                'allowed': sorted(allowed),
+                'excess_count': len(excess),
+                'excess': excess,
+                'missing_count': len(missing),
+                'missing': missing,
+                'clean': len(excess) == 0 and is_base_profile,
+            })
+        except Exception as e:
+            self.send_error_json(500, f'SSH failed: {e}')
+
+    def _handle_drone_clean(self, cp, drone_name: str, body: dict):
+        """Clean a drone: switch to base profile, write minimal @world, depclean."""
+        node = cp.db.get_node_by_name(drone_name) if cp.db else None
+        if not node:
+            self.send_error_json(404, f'Drone not found: {drone_name}')
+            return
+
+        ip = node.get('ip')
+        if not ip:
+            self.send_error_json(400, f'No IP for drone {drone_name}')
+            return
+
+        dry_run = body.get('dry_run', False)
+
+        # Get allowlist for this drone
+        allowed = cp.db.get_allowlist_packages(drone_name)
+        world_content = '\n'.join(sorted(allowed))
+
+        try:
+            import subprocess
+            steps = []
+
+            if dry_run:
+                steps.append(f'Would write {len(allowed)} packages to @world')
+                steps.append('Would switch to base profile')
+                steps.append('Would run emerge --depclean')
+                self.send_json({
+                    'status': 'dry_run',
+                    'drone': drone_name,
+                    'steps': steps,
+                    'world_packages': sorted(allowed),
+                })
+                return
+
+            # Step 1: Write @world
+            subprocess.run(
+                ['ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
+                 f'root@{ip}',
+                 f'echo "{world_content}" > /var/lib/portage/world'],
+                capture_output=True, text=True, timeout=15)
+            steps.append(f'Wrote {len(allowed)} packages to @world')
+
+            # Step 2: Switch profile
+            result = subprocess.run(
+                ['ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
+                 f'root@{ip}',
+                 'eselect profile set default/linux/amd64/23.0 2>&1'],
+                capture_output=True, text=True, timeout=15)
+            steps.append(f'Profile switch: {result.stdout.strip() or "done"}')
+
+            # Step 3: Depclean (background, can take a while)
+            subprocess.run(
+                ['ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
+                 f'root@{ip}',
+                 'nohup emerge --depclean --ask=n > /tmp/depclean.log 2>&1 &'],
+                capture_output=True, text=True, timeout=15)
+            steps.append('Started depclean in background (check /tmp/depclean.log on drone)')
+
+            self.send_json({
+                'status': 'ok',
+                'drone': drone_name,
+                'steps': steps,
+                'world_packages': sorted(allowed),
+            })
+        except Exception as e:
+            self.send_error_json(500, f'Clean failed: {e}')
 
 
 # ── Server startup ────────────────────────────────────────────────

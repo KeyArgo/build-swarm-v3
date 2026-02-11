@@ -163,3 +163,15 @@ CREATE TABLE IF NOT EXISTS releases (
 );
 CREATE INDEX IF NOT EXISTS idx_releases_status ON releases(status);
 CREATE INDEX IF NOT EXISTS idx_releases_version ON releases(version);
+
+-- Drone package allowlist: controls which packages are permitted on drones
+CREATE TABLE IF NOT EXISTS drone_allowlist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    drone_id TEXT,                      -- NULL = global default, or specific drone node name
+    package TEXT NOT NULL,              -- e.g. 'net-misc/openssh', 'dev-vcs/git'
+    reason TEXT,                        -- why it's allowed
+    added_at REAL DEFAULT (strftime('%s','now')),
+    added_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_allowlist_drone ON drone_allowlist(drone_id);
+CREATE INDEX IF NOT EXISTS idx_allowlist_package ON drone_allowlist(package);

@@ -105,6 +105,47 @@ class SwarmDB:
         except Exception as e:
             log.debug(f"Releases migration note: {e}")
 
+        # Create drone_allowlist table if missing (v3.2 bloat control)
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS drone_allowlist (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    drone_id TEXT,
+                    package TEXT NOT NULL,
+                    reason TEXT,
+                    added_at REAL DEFAULT (strftime('%s','now')),
+                    added_by TEXT
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_allowlist_drone ON drone_allowlist(drone_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_allowlist_package ON drone_allowlist(package)")
+            conn.commit()
+
+            # Seed global defaults if table is empty
+            count = conn.execute("SELECT COUNT(*) FROM drone_allowlist").fetchone()[0]
+            if count == 0:
+                defaults = [
+                    ('sys-apps/portage', 'Package manager (essential)'),
+                    ('dev-vcs/git', 'Version control (portage sync)'),
+                    ('net-misc/openssh', 'Remote access'),
+                    ('app-admin/sudo', 'Privilege escalation'),
+                    ('net-misc/dhcpcd', 'Network (DHCP)'),
+                    ('sys-kernel/gentoo-kernel-bin', 'Kernel'),
+                    ('sys-kernel/linux-firmware', 'Hardware firmware'),
+                    ('sys-boot/grub', 'Bootloader'),
+                    ('app-portage/gentoolkit', 'Portage utilities'),
+                    ('net-misc/curl', 'HTTP client'),
+                ]
+                for pkg, reason in defaults:
+                    conn.execute(
+                        "INSERT INTO drone_allowlist (drone_id, package, reason, added_by) "
+                        "VALUES (NULL, ?, ?, 'system')",
+                        (pkg, reason))
+                conn.commit()
+                log.info(f"Seeded {len(defaults)} global allowlist defaults")
+        except Exception as e:
+            log.debug(f"Allowlist migration note: {e}")
+
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         """Execute SQL with automatic retry on lock."""
         conn = self._get_conn()
@@ -837,6 +878,56 @@ class SwarmDB:
                 'password': config.get('ssh_password'),
             }
         return {'user': 'root', 'port': 22, 'key_path': None, 'password': None}
+
+    # ── Drone Allowlist (v3.2 bloat control) ──────────────────────────
+
+    def get_allowlist(self, drone_name: str = None) -> List[dict]:
+        """Get allowlist entries. If drone_name given, includes global + per-drone."""
+        if drone_name:
+            rows = self.fetchall("""
+                SELECT * FROM drone_allowlist
+                WHERE drone_id IS NULL OR drone_id = ?
+                ORDER BY drone_id NULLS FIRST, package
+            """, (drone_name,))
+        else:
+            rows = self.fetchall(
+                "SELECT * FROM drone_allowlist ORDER BY drone_id NULLS FIRST, package")
+        return [dict(r) for r in rows]
+
+    def get_allowlist_packages(self, drone_name: str) -> set:
+        """Get the set of allowed package names for a drone (global + per-drone)."""
+        rows = self.fetchall("""
+            SELECT package FROM drone_allowlist
+            WHERE drone_id IS NULL OR drone_id = ?
+        """, (drone_name,))
+        return {r['package'] for r in rows}
+
+    def add_allowlist(self, package: str, drone_name: str = None,
+                      reason: str = None, added_by: str = 'admin') -> int:
+        """Add a package to the allowlist. Returns the new row ID."""
+        cursor = self.execute("""
+            INSERT INTO drone_allowlist (drone_id, package, reason, added_by)
+            VALUES (?, ?, ?, ?)
+        """, (drone_name, package, reason, added_by))
+        return cursor.lastrowid
+
+    def remove_allowlist(self, entry_id: int) -> bool:
+        """Remove an allowlist entry by ID."""
+        cursor = self.execute(
+            "DELETE FROM drone_allowlist WHERE id = ?", (entry_id,))
+        return cursor.rowcount > 0
+
+    def remove_allowlist_by_package(self, package: str, drone_name: str = None) -> bool:
+        """Remove an allowlist entry by package name and optional drone."""
+        if drone_name:
+            cursor = self.execute(
+                "DELETE FROM drone_allowlist WHERE package = ? AND drone_id = ?",
+                (package, drone_name))
+        else:
+            cursor = self.execute(
+                "DELETE FROM drone_allowlist WHERE package = ? AND drone_id IS NULL",
+                (package,))
+        return cursor.rowcount > 0
 
     # ── Utility ───────────────────────────────────────────────────────
 
