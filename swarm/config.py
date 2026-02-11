@@ -62,7 +62,7 @@ ADMIN_SECRET = os.environ.get('ADMIN_SECRET', '')
 ADMIN_STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'admin')
 
 # Binhost configuration (primary = seasonal, secondary = always-on)
-BINHOST_PRIMARY_IP = os.environ.get('BINHOST_PRIMARY_IP', '10.0.0.200')
+BINHOST_PRIMARY_IP = os.environ.get('BINHOST_PRIMARY_IP', '10.0.0.199')
 BINHOST_SECONDARY_IP = os.environ.get('BINHOST_SECONDARY_IP', '100.114.16.118')
 BINHOST_PRIMARY_PATH = os.environ.get('BINHOST_PRIMARY_PATH', '/var/cache/binpkgs')
 BINHOST_SECONDARY_PATH = os.environ.get('BINHOST_SECONDARY_PATH', '/var/cache/binpkgs')

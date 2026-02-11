@@ -2412,13 +2412,13 @@ const description = "Build Swarm v3 control plane dashboard for distributed Gent
     // Stats
     if (data.stats) {
       const s = data.stats;
-      $('#hist-avg-time').textContent = fmtDuration(s.avg_duration);
-      $('#hist-success-rate').textContent = s.success_rate != null ? (s.success_rate * 100).toFixed(1) + '%' : '--';
-      $('#hist-total').textContent = s.total || 0;
+      $('#hist-avg-time').textContent = fmtDuration(s.avg_duration_s);
+      $('#hist-success-rate').textContent = s.success_rate != null ? s.success_rate.toFixed(1) + '%' : '--';
+      $('#hist-total').textContent = s.total_builds || 0;
     }
 
     // Table
-    const entries = data.entries || [];
+    const entries = data.history || [];
     if (entries.length === 0) {
       tbody.innerHTML = '<tr class="sv3-empty-row"><td colspan="5">No history entries yet</td></tr>';
       return;
@@ -2428,10 +2428,10 @@ const description = "Build Swarm v3 control plane dashboard for distributed Gent
       const st = e.status || 'success';
       return `<tr>
         <td>${esc(shortPkg(e.package))}</td>
-        <td>${esc(e.drone || '--')}</td>
+        <td>${esc(e.drone_name || '--')}</td>
         <td><span class="sv3-status-pill ${st}">${st}</span></td>
-        <td>${fmtDuration(e.duration)}</td>
-        <td>${fmtTime(e.timestamp)}</td>
+        <td>${fmtDuration(e.duration_seconds)}</td>
+        <td>${fmtTime(e.built_at)}</td>
       </tr>`;
     }).join('');
   }
@@ -2699,16 +2699,16 @@ const description = "Build Swarm v3 control plane dashboard for distributed Gent
 
   async function updateBuildRateChart() {
     var data = await fetchHistoryForCharts();
-    if (!data || !data.entries || data.entries.length < 2) {
+    if (!data || !data.history || data.history.length < 2) {
       $('#build-rate-chart').textContent = 'Waiting for history data...';
       return;
     }
 
     // Bucket by minute
     var buckets = {};
-    data.entries.forEach(function(e) {
-      if (!e.timestamp) return;
-      var minuteKey = Math.floor(e.timestamp / 60) * 60;
+    data.history.forEach(function(e) {
+      if (!e.built_at) return;
+      var minuteKey = Math.floor(e.built_at / 60) * 60;
       if (!buckets[minuteKey]) buckets[minuteKey] = { ok: 0, fail: 0 };
       if (e.status === 'failed') {
         buckets[minuteKey].fail++;
@@ -2834,7 +2834,7 @@ const description = "Build Swarm v3 control plane dashboard for distributed Gent
     var container = $('#duration-histogram');
     if (!container) return;
 
-    if (!data || !data.entries || data.entries.length === 0) {
+    if (!data || !data.history || data.history.length === 0) {
       container.innerHTML = '<div class="sv3-dp-empty">No history data for histogram</div>';
       return;
     }
@@ -2848,10 +2848,10 @@ const description = "Build Swarm v3 control plane dashboard for distributed Gent
       { label: '10m+', min: 600, max: Infinity, count: 0, color: '#ef4444' },
     ];
 
-    data.entries.forEach(function(e) {
-      if (e.duration == null) return;
+    data.history.forEach(function(e) {
+      if (e.duration_seconds == null) return;
       for (var i = 0; i < buckets.length; i++) {
-        if (e.duration >= buckets[i].min && e.duration < buckets[i].max) {
+        if (e.duration_seconds >= buckets[i].min && e.duration_seconds < buckets[i].max) {
           buckets[i].count++;
           break;
         }
@@ -2878,18 +2878,12 @@ const description = "Build Swarm v3 control plane dashboard for distributed Gent
     if (!container) return;
 
     // Try to use stats.per_drone from API response
-    if (data && data.stats && data.stats.per_drone) {
+    if (data && data.stats && data.stats.per_drone && data.stats.per_drone.length > 0) {
       var drones = data.stats.per_drone;
-      var keys = Object.keys(drones);
-      if (keys.length === 0) {
-        container.innerHTML = '<div class="sv3-dp-empty">No per-drone stats available</div>';
-        return;
-      }
-      container.innerHTML = keys.map(function(name) {
-        var d = drones[name];
+      container.innerHTML = drones.map(function(d) {
         var rate = d.total > 0 ? ((d.success / d.total) * 100) : 0;
         return '<div class="sv3-dp-row">' +
-          '<span class="sv3-dp-name">' + esc(name) + '</span>' +
+          '<span class="sv3-dp-name">' + esc(d.drone_name) + '</span>' +
           '<div class="sv3-dp-bar-wrap"><div class="sv3-dp-bar-fill" style="width:' + rate.toFixed(1) + '%"></div>' +
           '<span class="sv3-dp-bar-label">' + rate.toFixed(0) + '%</span></div>' +
           '<span class="sv3-dp-builds">' + (d.total || 0) + '</span>' +
@@ -2900,18 +2894,18 @@ const description = "Build Swarm v3 control plane dashboard for distributed Gent
     }
 
     // Fallback: aggregate from entries
-    if (!data || !data.entries || data.entries.length === 0) {
+    if (!data || !data.history || data.history.length === 0) {
       container.innerHTML = '<div class="sv3-dp-empty">No per-drone data available</div>';
       return;
     }
 
     var droneStats = {};
-    data.entries.forEach(function(e) {
-      var name = e.drone || 'unknown';
+    data.history.forEach(function(e) {
+      var name = e.drone_name || 'unknown';
       if (!droneStats[name]) droneStats[name] = { total: 0, success: 0, durSum: 0 };
       droneStats[name].total++;
       if (e.status !== 'failed') droneStats[name].success++;
-      if (e.duration) droneStats[name].durSum += e.duration;
+      if (e.duration_seconds) droneStats[name].durSum += e.duration_seconds;
     });
 
     var dKeys = Object.keys(droneStats);
@@ -3254,9 +3248,9 @@ const description = "Build Swarm v3 control plane dashboard for distributed Gent
     if (latF && latF.value) params.min_latency = latF.value;
 
     var data = await v3Get('/protocol', params);
-    if (!data || !data.entries) return;
+    if (!data || !data.history) return;
 
-    data.entries.forEach(function(e) {
+    data.history.forEach(function(e) {
       wireEntries.push(e);
       if (e.id > wireLastId) wireLastId = e.id;
       // Track observed drones
@@ -3483,8 +3477,8 @@ const description = "Build Swarm v3 control plane dashboard for distributed Gent
   async function pollTopoProtocol() {
     // Fetch recent protocol entries for topology packet animation
     var data = await v3Get('/protocol', { since: String(topoLastProtoId), limit: '50' });
-    if (!data || !data.entries) return;
-    data.entries.forEach(function(e) {
+    if (!data || !data.history) return;
+    data.history.forEach(function(e) {
       if (e.id > topoLastProtoId) topoLastProtoId = e.id;
       // Map source_node to drone index
       var droneName = e.source_node || e.drone_id;
@@ -3622,8 +3616,8 @@ const description = "Build Swarm v3 control plane dashboard for distributed Gent
 
   async function loadReplayEntries() {
     var data = await v3Get('/protocol', { limit: '5000' });
-    if (data && data.entries) {
-      replayEntries = data.entries.filter(function(e) {
+    if (data && data.history) {
+      replayEntries = data.history.filter(function(e) {
         return e.timestamp >= replayStartTime && e.timestamp <= replayEndTime;
       });
     }

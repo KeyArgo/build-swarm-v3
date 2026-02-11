@@ -33,44 +33,40 @@ const $$ = (sel, ctx) => [...(ctx || document).querySelectorAll(sel)];
 async function v3Get(path) {
   try {
     const res = await fetch(`${V3_API}${path}`, {
-      signal: AbortSignal.timeout(5000),
       headers: { 'Accept': 'application/json' },
     });
-    if (!res.ok) return null;
+    if (!res.ok) { console.warn('v3Get failed:', path, res.status); return null; }
     return await res.json();
-  } catch { return null; }
+  } catch (e) { console.error('v3Get error:', path, e); return null; }
 }
 
 async function v3Post(path, body) {
   try {
     const res = await fetch(`${V3_API}${path}`, {
       method: 'POST',
-      signal: AbortSignal.timeout(5000),
       headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
       body: body ? JSON.stringify(body) : undefined,
     });
-    if (!res.ok) return null;
+    if (!res.ok) { console.warn('v3Post failed:', path, res.status); return null; }
     return await res.json();
-  } catch { return null; }
+  } catch (e) { console.error('v3Post error:', path, e); return null; }
 }
 
 async function adminGet(path) {
   try {
     const res = await fetch(`${ADMIN_API}${path}`, {
-      signal: AbortSignal.timeout(5000),
       headers: { 'Accept': 'application/json', 'X-Admin-Key': adminKey },
     });
     if (res.status === 401) { showLogin(); return null; }
-    if (!res.ok) return null;
+    if (!res.ok) { console.warn('adminGet failed:', path, res.status); return null; }
     return await res.json();
-  } catch { return null; }
+  } catch (e) { console.error('adminGet error:', path, e); return null; }
 }
 
 async function adminPost(path, body) {
   try {
     const res = await fetch(`${ADMIN_API}${path}`, {
       method: 'POST',
-      signal: AbortSignal.timeout(5000),
       headers: {
         'Accept': 'application/json',
         'Content-Type': 'application/json',
@@ -79,9 +75,9 @@ async function adminPost(path, body) {
       body: body ? JSON.stringify(body) : undefined,
     });
     if (res.status === 401) { showLogin(); return null; }
-    if (!res.ok) return null;
+    if (!res.ok) { console.warn('adminPost failed:', path, res.status); return null; }
     return await res.json();
-  } catch { return null; }
+  } catch (e) { console.error('adminPost error:', path, e); return null; }
 }
 
 // ── Auth ──
@@ -167,6 +163,7 @@ function setConnected(online) {
 async function refresh() {
   // Fetch v3 status
   const status = await v3Get('/status');
+  console.log('refresh: status =', status ? 'OK' : 'NULL', status ? `nodes=${status.nodes}` : '');
   if (!status) {
     setConnected(false);
     return;
@@ -1077,6 +1074,7 @@ async function refreshSystemInfo() {
 
 let refreshCount = 0;
 function startRefresh() {
+  console.log('startRefresh: V3_API =', V3_API, 'ADMIN_API =', ADMIN_API);
   refresh();
   refreshSystemInfo();
   updateBuildRateChart();

@@ -461,18 +461,26 @@ class SwarmDB:
         """, (package, drone_id)))
 
     def has_drone_failed_package(self, drone_id: str, package: str) -> bool:
-        """Check if this drone has previously failed to build this package."""
+        """Check if this drone has previously failed to build this package.
+
+        Only counts actual build failures, NOT upload failures (which are
+        infrastructure issues, not package-specific problems).
+        """
         return bool(self.fetchval("""
             SELECT 1 FROM build_history
-            WHERE drone_id = ? AND package = ? AND status NOT IN ('success', 'returned')
+            WHERE drone_id = ? AND package = ?
+              AND status NOT IN ('success', 'returned', 'upload_failed')
             LIMIT 1
         """, (drone_id, package)))
 
     def count_distinct_drone_failures(self, package: str) -> int:
-        """Count how many different drones have failed this package."""
+        """Count how many different drones have failed this package.
+
+        Only counts actual build failures, NOT upload failures.
+        """
         return self.fetchval("""
             SELECT COUNT(DISTINCT drone_id) FROM build_history
-            WHERE package = ? AND status NOT IN ('success', 'returned')
+            WHERE package = ? AND status NOT IN ('success', 'returned', 'upload_failed')
         """, (package,)) or 0
 
     # ── Drone Health (Circuit Breaker) ────────────────────────────────
