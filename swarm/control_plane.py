@@ -81,7 +81,7 @@ class V3Handler(BaseHTTPRequestHandler):
     def send_cors_headers(self):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Accept, X-Admin-Key')
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -529,7 +529,7 @@ class V3Handler(BaseHTTPRequestHandler):
             p = (session_id,) if session_id else ()
             rows = db.fetchall(f"""
                 SELECT package, status, assigned_to, failure_count,
-                       assigned_at, created_at
+                       error_message, assigned_at, completed_at, created_at
                 FROM queue {where}
                 ORDER BY
                     CASE status
@@ -550,6 +550,9 @@ class V3Handler(BaseHTTPRequestHandler):
                     'status': r['status'],
                     'assigned_to': drone_name,
                     'failures': r['failure_count'],
+                    'error_message': r['error_message'] or '',
+                    'assigned_at': r['assigned_at'],
+                    'completed_at': r['completed_at'],
                 })
             self.send_json(result)
 
