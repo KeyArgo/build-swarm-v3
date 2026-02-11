@@ -634,6 +634,13 @@ class V3Handler(BaseHTTPRequestHandler):
                 version=data.get('version'),
             )
 
+            # v3.2: Track build acknowledgment — if drone's current_task matches
+            # one of its own delegated packages, mark it as actively building.
+            current_task = data.get('current_task')
+            if current_task and node_id:
+                if db.is_package_assigned_to(current_task, node_id):
+                    db.mark_building(current_task, node_id)
+
             # Preserve paused state
             node = db.get_node(node_id)
             reachable = get_reachable_ip(ip)
@@ -1016,11 +1023,16 @@ def _metrics_recorder():
 
 
 def _reclaim_stale_builds():
-    """Detect and restart drones building packages assigned to other drones.
+    """Monitor drone build activity (informational only).
 
-    When the CP restarts or rebalances packages, v2 agents keep building
-    from their local state. This detects that mismatch and restarts the
-    drone service to free it up for new work.
+    v3.2: Gutted — the old logic compared heartbeat current_task against
+    the queue assignment map, but current_task reports whatever emerge is
+    compiling (including DEPENDENCIES), not the CP-assigned package.
+    This caused constant false-positive restarts.
+
+    Legitimate reclamation is handled by:
+    - scheduler.reclaim_offline_work() — for offline drones
+    - health_monitor.check_grounded() — for drones with too many failures
     """
     drones = db.get_all_nodes(include_offline=False)
     delegated = db.get_delegated_packages()
@@ -1036,19 +1048,15 @@ def _reclaim_stale_builds():
             continue
 
         drone_id = d['id']
-        drone_ip = d.get('ip')
         drone_name = d.get('name', drone_id[:12])
 
-        # If this drone is building a package assigned to a DIFFERENT drone, it's stale
+        # If this drone reports building someone else's package, just log it.
+        # This is EXPECTED when the drone is compiling a dependency of its
+        # own assigned package (e.g., gcc as a dep of kservice).
         if task in pkg_owner and pkg_owner[task] != drone_id:
             owner_name = db.get_drone_name(pkg_owner[task])
-            log.warning(f"[STALE-BUILD] {drone_name} is building {task} "
-                        f"but it's assigned to {owner_name} — restarting service")
-            add_event('control',
-                      f"{drone_name} restarted: stale build of {task} (assigned to {owner_name})",
-                      {'drone': drone_name, 'package': task, 'owner': owner_name})
-            if drone_ip:
-                health_monitor.restart_drone_service(drone_id, drone_ip)
+            log.debug(f"[BUILD-NOTE] {drone_name} compiling {task} "
+                      f"(assigned to {owner_name}) — likely a dependency")
 
 
 def _maintenance_loop():

@@ -261,6 +261,10 @@ class Scheduler:
             donor_pkgs.sort(key=lambda p: p.get('assigned_at', 0), reverse=True)
             max_take = len(donor_pkgs) // 2
 
+            # v3.2: Get donor's current_task to avoid stealing active compiles
+            donor_node = self.db.get_node(donor_id)
+            donor_current_task = donor_node.get('current_task') if donor_node else None
+
             taken = 0
             for pkg in donor_pkgs:
                 if stolen >= queue_target or taken >= max_take:
@@ -269,9 +273,23 @@ class Scheduler:
                 if remaining <= 2:
                     break
 
-                # Reassign
+                # v3.2: Never steal a package confirmed as actively building
+                if pkg.get('building_since') is not None:
+                    continue
+
+                # v3.2: Skip if package matches donor's current_task (likely compiling)
+                if donor_current_task and pkg['package'] == donor_current_task:
+                    continue
+
+                # v3.2: Only steal packages assigned recently (< 60s) — older ones
+                # are likely already being compiled or queued in emerge
+                if pkg.get('assigned_at') and (time.time() - pkg['assigned_at']) > 60:
+                    continue
+
+                # Reassign (clear building_since since new drone hasn't started)
                 self.db.execute("""
-                    UPDATE queue SET assigned_to = ?, assigned_at = ?
+                    UPDATE queue SET assigned_to = ?, assigned_at = ?,
+                        building_since = NULL
                     WHERE id = ? AND assigned_to = ? AND status = 'delegated'
                 """, (drone_id, time.time(), pkg['id'], donor_id))
 

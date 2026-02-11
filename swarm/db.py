@@ -71,6 +71,15 @@ class SwarmDB:
         except Exception as e:
             log.debug(f"Migration note: {e}")
 
+        # Add building_since column to queue table (v3.2 delegation fix)
+        try:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(queue)").fetchall()}
+            if 'building_since' not in cols:
+                conn.execute("ALTER TABLE queue ADD COLUMN building_since REAL")
+            conn.commit()
+        except Exception as e:
+            log.debug(f"Queue migration note: {e}")
+
         # Create releases table if missing (v3.1.1+)
         try:
             conn.execute("""
@@ -380,7 +389,8 @@ class SwarmDB:
         elif status == 'returned':
             # Re-queue (not a failure)
             self.execute("""
-                UPDATE queue SET status = 'needed', assigned_to = NULL, assigned_at = NULL
+                UPDATE queue SET status = 'needed', assigned_to = NULL,
+                    assigned_at = NULL, building_since = NULL
                 WHERE package = ? AND status = 'delegated' AND assigned_to = ?
             """, (package, drone_id))
 
@@ -430,7 +440,8 @@ class SwarmDB:
     def reclaim_package(self, package: str) -> bool:
         """Reclaim a delegated package back to needed queue."""
         cursor = self.execute("""
-            UPDATE queue SET status = 'needed', assigned_to = NULL, assigned_at = NULL
+            UPDATE queue SET status = 'needed', assigned_to = NULL,
+                assigned_at = NULL, building_since = NULL
             WHERE package = ? AND status = 'delegated'
         """, (package,))
         return cursor.rowcount > 0
@@ -466,18 +477,33 @@ class SwarmDB:
         if session_id:
             cursor = self.execute("""
                 UPDATE queue SET status = 'needed', assigned_to = NULL,
-                    assigned_at = NULL, completed_at = NULL,
-                    failure_count = 0, error_message = NULL
+                    assigned_at = NULL, building_since = NULL,
+                    completed_at = NULL, failure_count = 0, error_message = NULL
                 WHERE session_id = ? AND status != 'received'
             """, (session_id,))
         else:
             cursor = self.execute("""
                 UPDATE queue SET status = 'needed', assigned_to = NULL,
-                    assigned_at = NULL, completed_at = NULL,
-                    failure_count = 0, error_message = NULL
+                    assigned_at = NULL, building_since = NULL,
+                    completed_at = NULL, failure_count = 0, error_message = NULL
                 WHERE status NOT IN ('received')
             """)
         return cursor.rowcount
+
+    # ── Build Tracking (v3.2 delegation fix) ─────────────────────────
+
+    def mark_building(self, package: str, drone_id: str) -> bool:
+        """Mark a delegated package as actively being built by its assigned drone.
+
+        Called when a drone's heartbeat current_task matches one of its own
+        delegated packages. Only sets building_since once (first match wins).
+        """
+        cursor = self.execute("""
+            UPDATE queue SET building_since = ?
+            WHERE package = ? AND assigned_to = ? AND status = 'delegated'
+              AND building_since IS NULL
+        """, (time.time(), package, drone_id))
+        return cursor.rowcount > 0
 
     # ── Assignment Validation (v3.1 stale completion filtering) ──────
 

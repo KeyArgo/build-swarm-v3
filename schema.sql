@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS queue (
         CHECK(status IN ('needed','delegated','received','blocked','failed')),
     assigned_to TEXT REFERENCES nodes(id),
     assigned_at REAL,
+    building_since REAL,              -- when drone confirmed it started compiling
     completed_at REAL,
     failure_count INTEGER DEFAULT 0,
     error_message TEXT,
