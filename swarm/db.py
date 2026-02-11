@@ -420,12 +420,22 @@ class SwarmDB:
         now = time.time()
 
         if status == 'success':
-            # Mark as received
-            self.execute("""
+            # Mark as received — first try the exact match (delegated to this drone)
+            cursor = self.execute("""
                 UPDATE queue SET status = 'received', completed_at = ?,
-                    failure_count = 0, error_message = NULL
+                    failure_count = 0, error_message = NULL, building_since = NULL
                 WHERE package = ? AND status = 'delegated' AND assigned_to = ?
             """, (now, package, drone_id))
+
+            # v3.2: Fallback for "free work" — package was reclaimed (now 'needed')
+            # but the drone still built it successfully. Accept the work.
+            if cursor.rowcount == 0:
+                self.execute("""
+                    UPDATE queue SET status = 'received', completed_at = ?,
+                        assigned_to = ?, failure_count = 0, error_message = NULL,
+                        building_since = NULL
+                    WHERE package = ? AND status = 'needed'
+                """, (now, drone_id, package))
 
         elif status == 'returned':
             # Re-queue (not a failure)

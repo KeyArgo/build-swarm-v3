@@ -41,7 +41,7 @@ GROUNDING_TIMEOUT_MINUTES = int(os.environ.get('GROUNDING_TIMEOUT', 5))
 FAILURE_AGE_MINUTES = int(os.environ.get('FAILURE_AGE_MINUTES', 30))
 QUEUE_TARGET = int(os.environ.get('QUEUE_TARGET', 5))
 CORES_PER_SLOT = int(os.environ.get('CORES_PER_SLOT', 4))
-NODE_TIMEOUT = int(os.environ.get('NODE_TIMEOUT', 30))
+NODE_TIMEOUT = int(os.environ.get('NODE_TIMEOUT', 60))
 STALE_TIMEOUT = int(os.environ.get('STALE_TIMEOUT', 300))
 
 # Sweeper configuration
