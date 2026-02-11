@@ -987,14 +987,56 @@ def _metrics_recorder():
             log.error(f"Metrics recorder error: {e}")
 
 
+def _reclaim_stale_builds():
+    """Detect and restart drones building packages assigned to other drones.
+
+    When the CP restarts or rebalances packages, v2 agents keep building
+    from their local state. This detects that mismatch and restarts the
+    drone service to free it up for new work.
+    """
+    drones = db.get_all_nodes(include_offline=False)
+    delegated = db.get_delegated_packages()
+
+    # Build map: package -> assigned drone_id
+    pkg_owner = {}
+    for pkg in delegated:
+        pkg_owner[pkg['package']] = pkg['assigned_to']
+
+    for d in drones:
+        task = d.get('current_task')
+        if not task:
+            continue
+
+        drone_id = d['id']
+        drone_ip = d.get('ip')
+        drone_name = d.get('name', drone_id[:12])
+
+        # If this drone is building a package assigned to a DIFFERENT drone, it's stale
+        if task in pkg_owner and pkg_owner[task] != drone_id:
+            owner_name = db.get_drone_name(pkg_owner[task])
+            log.warning(f"[STALE-BUILD] {drone_name} is building {task} "
+                        f"but it's assigned to {owner_name} — restarting service")
+            add_event('control',
+                      f"{drone_name} restarted: stale build of {task} (assigned to {owner_name})",
+                      {'drone': drone_name, 'package': task, 'owner': owner_name})
+            if drone_ip:
+                health_monitor.restart_drone_service(drone_id, drone_ip)
+
+
 def _maintenance_loop():
     """Background maintenance: reclaim work, update status, auto-age blocks."""
+    _maint_cycle = 0
     while True:
         time.sleep(15)
         try:
             db.update_node_status(cfg.NODE_TIMEOUT, cfg.STALE_TIMEOUT)
             scheduler.reclaim_offline_work()
             scheduler.auto_age_blocked()
+
+            # Check for stale builds every 4th cycle (~60s)
+            _maint_cycle += 1
+            if _maint_cycle % 4 == 0:
+                _reclaim_stale_builds()
         except Exception as e:
             log.error(f"Maintenance loop error: {e}")
 
