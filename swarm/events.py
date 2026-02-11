@@ -126,7 +126,7 @@ def get_events_since(since_id: int = 0) -> tuple:
 
 
 def get_events_db(since_ts: float = None, event_type: str = None,
-                  limit: int = 500) -> list:
+                  drone_id: str = None, limit: int = 500) -> list:
     """Query persistent events from SQLite with filters."""
     if _db is None:
         return []
@@ -140,6 +140,9 @@ def get_events_db(since_ts: float = None, event_type: str = None,
     if event_type:
         conditions.append("event_type = ?")
         params.append(event_type)
+    if drone_id:
+        conditions.append("drone_id = ?")
+        params.append(drone_id)
 
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     params.append(min(limit, 2000))

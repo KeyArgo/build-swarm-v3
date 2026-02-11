@@ -442,6 +442,12 @@ class AdminHandler(BaseHTTPRequestHandler):
             self._handle_drone_audit(cp, drone_name)
             return
 
+        # Per-drone log viewer
+        if path.startswith('/admin/api/drones/') and path.endswith('/log'):
+            drone_name = path.split('/')[4]
+            self._handle_drone_log(cp, drone_name, params)
+            return
+
         # V2 proxy (GET endpoints)
         if path == '/admin/api/v2/nodes':
             self._proxy_v2('/api/v1/nodes?all=true')
@@ -657,6 +663,45 @@ class AdminHandler(BaseHTTPRequestHandler):
             })
         except Exception as e:
             self.send_error_json(500, f'SSH failed: {e}')
+
+    def _handle_drone_log(self, cp, drone_name: str, params: dict):
+        """Combined event + build history log for a specific drone."""
+        from .events import get_events_db
+        import time
+
+        node = cp.db.get_node_by_name(drone_name) if cp.db else None
+        if not node:
+            self.send_error_json(404, f'Drone not found: {drone_name}')
+            return
+
+        drone_id = node['id']
+        limit = int(params.get('limit', ['200'])[0])
+        since_h = float(params.get('hours', ['24'])[0])
+        since_ts = time.time() - since_h * 3600
+
+        # Events for this drone (search by name since events store drone name)
+        events = get_events_db(since_ts=since_ts, drone_id=drone_name, limit=limit)
+
+        # Build history for this drone
+        builds = cp.db.fetchall("""
+            SELECT package, status, drone_name, duration_seconds,
+                   built_at, error_message, session_id
+            FROM build_history
+            WHERE drone_id = ? AND built_at > ?
+            ORDER BY built_at DESC LIMIT ?
+        """, (drone_id, since_ts, limit))
+
+        # Connection timeline: find register events to track online/offline
+        connection_events = [e for e in events if e['type'] in ('register', 'stale', 'control')]
+
+        self.send_json({
+            'drone': drone_name,
+            'drone_id': drone_id,
+            'since': since_ts,
+            'events': events,
+            'builds': [dict(b) for b in builds],
+            'connections': connection_events,
+        })
 
     def _handle_drone_audit(self, cp, drone_name: str):
         """Audit a drone: compare installed packages against allowlist."""

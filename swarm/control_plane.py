@@ -420,8 +420,10 @@ class V3Handler(BaseHTTPRequestHandler):
             since = params.get('since', [None])[0]
             since_ts = float(since) if since else None
             etype = params.get('type', [None])[0]
+            drone = params.get('drone', [None])[0]
             limit = int(params.get('limit', ['500'])[0])
-            events = get_events_db(since_ts=since_ts, event_type=etype, limit=limit)
+            events = get_events_db(since_ts=since_ts, event_type=etype,
+                                   drone_id=drone, limit=limit)
             self.send_json({'events': events, 'total': len(events)})
 
         # ── SQL Explorer (v3.1) ──

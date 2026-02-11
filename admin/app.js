@@ -840,24 +840,26 @@ async function removeAllowlistEntry(id) {
 }
 
 async function populateAuditDroneSelect(nodes) {
-  const sel = $('#audit-drone-select');
-  if (!sel) return;
   // If no nodes passed, fetch them
   if (!nodes || nodes.length === 0) {
     nodes = await v3Get('/nodes?all=true');
     if (Array.isArray(nodes)) window._lastV3Nodes = nodes;
   }
-  const current = sel.value;
-  // Keep first option
-  while (sel.options.length > 1) sel.remove(1);
   const drones = (nodes || []).filter(n => n.type === 'drone');
-  for (const d of drones) {
-    const opt = document.createElement('option');
-    opt.value = d.name;
-    opt.textContent = `${d.name} (${d.ip || d.tailscale_ip || '?'})`;
-    sel.appendChild(opt);
+  // Populate both audit and log selectors
+  for (const selId of ['#audit-drone-select', '#log-drone-select']) {
+    const sel = $(selId);
+    if (!sel) continue;
+    const current = sel.value;
+    while (sel.options.length > 1) sel.remove(1);
+    for (const d of drones) {
+      const opt = document.createElement('option');
+      opt.value = d.name;
+      opt.textContent = `${d.name} (${d.ip || d.tailscale_ip || '?'})`;
+      sel.appendChild(opt);
+    }
+    if (current) sel.value = current;
   }
-  if (current) sel.value = current;
 }
 
 async function runBloatAudit() {
@@ -923,6 +925,75 @@ async function runDroneClean() {
   } else {
     $('#audit-details').innerHTML += `<div style="margin-top:0.5rem;color:var(--red)">Clean failed: ${esc(result?.error || 'Unknown')}</div>`;
   }
+}
+
+// ── Drone Log Viewer ──
+
+async function loadDroneLog() {
+  const name = $('#log-drone-select')?.value;
+  if (!name) return;
+  const hours = $('#log-hours-select')?.value || '24';
+  const result = await adminGet(`/drones/${encodeURIComponent(name)}/log?hours=${hours}`);
+  if (!result) return;
+
+  const panel = $('#drone-log-result');
+  panel.style.display = 'block';
+
+  setText('#log-event-count', result.events?.length || 0);
+  setText('#log-build-count', result.builds?.length || 0);
+  setText('#log-conn-count', result.connections?.length || 0);
+
+  // Merge events and builds into unified timeline
+  const entries = [];
+  for (const e of (result.events || [])) {
+    entries.push({
+      ts: e.timestamp,
+      type: e.type,
+      msg: e.message,
+      icon: e.type === 'complete' ? '\u2705' : e.type === 'fail' ? '\u274C' : e.type === 'register' ? '\uD83D\uDD17' : '\u25CF',
+      color: e.type === 'complete' ? 'var(--green)' : e.type === 'fail' ? 'var(--red)' : e.type === 'register' ? 'var(--cyan)' : 'var(--text-muted)',
+    });
+  }
+  for (const b of (result.builds || [])) {
+    // Only add if not already represented by an event
+    const dur = b.duration_seconds ? ` (${fmtDuration(b.duration_seconds)})` : '';
+    entries.push({
+      ts: b.built_at,
+      type: 'build-' + b.status,
+      msg: `Build ${b.status}: ${b.package}${dur}${b.error_message ? ' — ' + b.error_message : ''}`,
+      icon: b.status === 'success' ? '\uD83D\uDCE6' : '\uD83D\uDCA5',
+      color: b.status === 'success' ? 'var(--green)' : 'var(--red)',
+    });
+  }
+
+  // Sort by timestamp descending (newest first)
+  entries.sort((a, b) => b.ts - a.ts);
+
+  // Deduplicate: if event and build share same ts and package, keep event
+  const seen = new Set();
+  const unique = entries.filter(e => {
+    const key = Math.floor(e.ts) + ':' + e.msg?.slice(0, 30);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  const container = $('#drone-log-entries');
+  if (unique.length === 0) {
+    container.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:2rem">No activity in selected time range</div>';
+    return;
+  }
+
+  container.innerHTML = unique.map(e => {
+    const dt = new Date(e.ts * 1000);
+    const time = dt.toLocaleTimeString('en-US', {hour12: false});
+    const date = dt.toLocaleDateString('en-US', {month:'short', day:'numeric'});
+    return `<div style="display:flex;gap:0.5rem;padding:2px 0;border-bottom:1px solid rgba(255,255,255,0.03)">
+      <span style="color:var(--text-muted);min-width:105px">${date} ${time}</span>
+      <span style="min-width:18px">${e.icon}</span>
+      <span style="color:${e.color}">${esc(e.msg)}</span>
+    </div>`;
+  }).join('');
 }
 
 // ── Binhost tab ──

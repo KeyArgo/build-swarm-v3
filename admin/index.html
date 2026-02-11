@@ -493,6 +493,43 @@
         <div id="audit-details"></div>
       </div>
     </div>
+
+    <!-- Drone Log Viewer -->
+    <div class="section-card">
+      <h3>Drone Activity Log</h3>
+      <p style="color:var(--text-dim);font-size:0.8rem;margin-bottom:1rem">
+        View events, builds, and connection history for a specific drone.
+      </p>
+      <div style="display:flex;gap:0.75rem;align-items:center;margin-bottom:1rem">
+        <select id="log-drone-select" style="flex:1;padding:0.5rem;background:var(--surface);border:1px solid var(--border);color:var(--text);border-radius:4px">
+          <option value="">Select drone...</option>
+        </select>
+        <select id="log-hours-select" style="padding:0.5rem;background:var(--surface);border:1px solid var(--border);color:var(--text);border-radius:4px">
+          <option value="1">Last 1h</option>
+          <option value="6">Last 6h</option>
+          <option value="24" selected>Last 24h</option>
+          <option value="72">Last 3 days</option>
+        </select>
+        <button class="btn" onclick="loadDroneLog()">Load</button>
+      </div>
+      <div id="drone-log-result" style="display:none">
+        <div class="cards-row" style="margin-bottom:1rem">
+          <div class="stat-card">
+            <div class="label">Events</div>
+            <div class="value" id="log-event-count">-</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">Builds</div>
+            <div class="value" id="log-build-count">-</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">Connections</div>
+            <div class="value" id="log-conn-count">-</div>
+          </div>
+        </div>
+        <div id="drone-log-entries" style="max-height:500px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:0.72rem;background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:0.75rem"></div>
+      </div>
+    </div>
   </div>
 
   <!-- ═══════════════════ BINHOST TAB ═══════════════════ -->
