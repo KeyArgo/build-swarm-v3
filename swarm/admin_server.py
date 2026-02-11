@@ -406,6 +406,21 @@ class AdminHandler(BaseHTTPRequestHandler):
             self.send_json(result)
             return
 
+        # Reset upload failures for a drone
+        if path.startswith('/admin/api/drone/') and path.endswith('/reset-upload'):
+            drone_name = path.split('/')[4]
+            if cp.db:
+                # Find the drone's node ID
+                node = cp.db.fetchone("SELECT id FROM nodes WHERE name = ?", (drone_name,))
+                if node:
+                    cp.db.reset_upload_failures(node['id'])
+                    self.send_json({'status': 'ok', 'drone': drone_name, 'message': 'Upload failures reset'})
+                else:
+                    self.send_error_json(404, f'Drone not found: {drone_name}')
+            else:
+                self.send_error_json(500, 'Database not available')
+            return
+
         # Drone lock/unlock/audit stubs (will be implemented in Phase 4)
         if path.startswith('/admin/api/drone/') and path.endswith('/lock'):
             drone_name = path.split('/')[4]

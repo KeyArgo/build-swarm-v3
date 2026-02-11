@@ -76,7 +76,9 @@ CREATE TABLE IF NOT EXISTS drone_health (
     failures INTEGER DEFAULT 0,
     last_failure REAL,
     rebooted INTEGER DEFAULT 0,
-    grounded_until REAL
+    grounded_until REAL,
+    upload_failures INTEGER DEFAULT 0,
+    last_upload_failure REAL
 );
 
 -- Metrics time-series (ring buffer for charting)

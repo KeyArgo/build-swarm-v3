@@ -48,6 +48,10 @@ STALE_TIMEOUT = int(os.environ.get('STALE_TIMEOUT', 300))
 SWEEPER_PREFIX = os.environ.get('SWEEPER_PREFIX', 'sweeper-')
 SWEEPER_THRESHOLD = int(os.environ.get('SWEEPER_THRESHOLD', MAX_DRONE_FAILURES))
 
+# Upload failure circuit breaker (network-aware scheduling)
+MAX_UPLOAD_FAILURES = int(os.environ.get('MAX_UPLOAD_FAILURES', 3))
+UPLOAD_RETRY_INTERVAL_M = int(os.environ.get('UPLOAD_RETRY_INTERVAL_M', 30))
+
 # Staging paths (separate from v2)
 STAGING_PATH = os.environ.get('STAGING_PATH', '/var/cache/binpkgs-v3-staging')
 BINHOST_PATH = os.environ.get('BINHOST_PATH', '/var/cache/binpkgs-v3')

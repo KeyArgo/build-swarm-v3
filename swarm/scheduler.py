@@ -76,6 +76,12 @@ class Scheduler:
         if self.health.check_grounded(drone_id, drone_ip):
             return None
 
+        # Upload capability check — don't assign work to drones that can't deliver
+        if self.health.is_upload_impaired(drone_id):
+            drone_name_log = self.db.get_drone_name(drone_id)
+            log.debug(f"Upload-impaired, no work for {drone_name_log}")
+            return None
+
         # Check existing assignments
         assigned = self.db.get_delegated_packages(drone_id)
         if assigned:

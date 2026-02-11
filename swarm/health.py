@@ -83,6 +83,32 @@ class DroneHealthMonitor:
         """Record a build failure — trips circuit breaker."""
         return self.db.record_drone_failure(drone_id)
 
+    def record_upload_failure(self, drone_id: str):
+        """Record an upload failure — separate from build failures.
+
+        Upload failures mean the drone built successfully but couldn't
+        deliver the binary (e.g., Tailscale drone can't rsync to LAN).
+        This does NOT trip the general circuit breaker.
+        """
+        self.db.record_upload_failure(drone_id)
+        drone_name = self.db.get_drone_name(drone_id)
+        health = self.db.get_drone_health(drone_id) or {}
+        count = health.get('upload_failures', 0)
+        log.warning(f"[UPLOAD-FAIL] {drone_name}: upload failure #{count} "
+                    f"(threshold: {cfg.MAX_UPLOAD_FAILURES})")
+        if count >= cfg.MAX_UPLOAD_FAILURES:
+            log.warning(f"[UPLOAD-IMPAIRED] {drone_name}: no more work until upload succeeds "
+                        f"or {cfg.UPLOAD_RETRY_INTERVAL_M}m retry window")
+
+    def reset_upload_failures(self, drone_id: str):
+        """Reset upload failure count — called on successful delivery."""
+        self.db.reset_upload_failures(drone_id)
+
+    def is_upload_impaired(self, drone_id: str) -> bool:
+        """Check if drone can't deliver binaries."""
+        return self.db.is_upload_impaired(
+            drone_id, cfg.MAX_UPLOAD_FAILURES, cfg.UPLOAD_RETRY_INTERVAL_M)
+
     def _reclaim_drone_work(self, drone_id: str):
         """Reclaim all delegated packages from a grounded drone."""
         packages = self.db.get_delegated_packages(drone_id)

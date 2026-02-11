@@ -63,6 +63,10 @@ class SwarmDB:
                 conn.execute("ALTER TABLE drone_health ADD COLUMN last_probe_result TEXT")
             if 'last_probe_at' not in cols:
                 conn.execute("ALTER TABLE drone_health ADD COLUMN last_probe_at REAL")
+            if 'upload_failures' not in cols:
+                conn.execute("ALTER TABLE drone_health ADD COLUMN upload_failures INTEGER DEFAULT 0")
+            if 'last_upload_failure' not in cols:
+                conn.execute("ALTER TABLE drone_health ADD COLUMN last_upload_failure REAL")
             conn.commit()
         except Exception as e:
             log.debug(f"Migration note: {e}")
@@ -493,6 +497,41 @@ class SwarmDB:
                 last_failure = ?
         """, (node_id, now, now))
         return self.get_drone_health(node_id)
+
+    def record_upload_failure(self, node_id: str):
+        """Record a drone upload failure (network-aware scheduling)."""
+        now = time.time()
+        self.execute("""
+            INSERT INTO drone_health (node_id, upload_failures, last_upload_failure)
+            VALUES (?, 1, ?)
+            ON CONFLICT(node_id) DO UPDATE SET
+                upload_failures = upload_failures + 1,
+                last_upload_failure = ?
+        """, (node_id, now, now))
+
+    def reset_upload_failures(self, node_id: str):
+        """Reset upload failure count for a drone (e.g., after successful upload)."""
+        self.execute(
+            "UPDATE drone_health SET upload_failures = 0 WHERE node_id = ?",
+            (node_id,))
+
+    def is_upload_impaired(self, node_id: str, threshold: int, retry_minutes: int) -> bool:
+        """Check if a drone has too many consecutive upload failures.
+
+        Returns True if upload_failures >= threshold AND the last failure
+        is recent (within retry_minutes). If enough time has passed,
+        allows a retry by returning False.
+        """
+        row = self.fetchone(
+            "SELECT upload_failures, last_upload_failure FROM drone_health WHERE node_id = ?",
+            (node_id,))
+        if not row or (row['upload_failures'] or 0) < threshold:
+            return False
+        # Allow periodic retry
+        last = row['last_upload_failure'] or 0
+        if time.time() - last > retry_minutes * 60:
+            return False  # Enough time passed, let them try again
+        return True
 
     def reset_drone_health(self, node_id: str = None):
         """Reset circuit breaker for a drone (or all drones)."""

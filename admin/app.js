@@ -426,7 +426,8 @@ async function refreshFleet() {
         const isPaused = n.paused;
 
         let healthBadge = '<span class="badge online">ok</span>';
-        if (isGrounded) healthBadge = '<span class="badge grounded">grounded</span>';
+        if ((h.upload_failures || 0) >= 3) healthBadge = '<span class="badge grounded">upload err</span>';
+        else if (isGrounded) healthBadge = '<span class="badge grounded">grounded</span>';
         else if ((h.failures || 0) > 0) healthBadge = `<span class="badge offline">${h.failures} fails</span>`;
 
         const lockBadge = cfg.locked ? ' <span class="badge locked" title="Bloat locked">L</span>' : '';

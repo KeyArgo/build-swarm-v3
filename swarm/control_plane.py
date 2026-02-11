@@ -672,6 +672,7 @@ class V3Handler(BaseHTTPRequestHandler):
 
             if status == 'success':
                 health_monitor.record_success(drone_id)
+                health_monitor.reset_upload_failures(drone_id)
                 dur_str = f" in {duration:.1f}s" if duration > 0 else ""
                 log.info(f"[RECV] {package} <- {drone_name}{dur_str}")
                 add_event('complete', f"{package} completed on {drone_name}{dur_str}",
@@ -680,6 +681,8 @@ class V3Handler(BaseHTTPRequestHandler):
                 log.info(f"[RETURNED] {package} by {drone_name} ({error_detail or 'unspecified'})")
                 add_event('return', f"{package} returned by {drone_name}",
                           {'package': package, 'drone': drone_name, 'reason': error_detail})
+            elif status == 'upload_failed':
+                health_monitor.record_upload_failure(drone_id)
             else:
                 health_monitor.record_failure(drone_id)
                 log.warning(f"[FAIL] {package} on {drone_name} ({status})")
