@@ -61,6 +61,10 @@ ADMIN_PORT = int(os.environ.get('ADMIN_PORT', 8093))
 ADMIN_SECRET = os.environ.get('ADMIN_SECRET', '')
 ADMIN_STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'admin')
 
+# Release management
+RELEASES_BASE_PATH = os.environ.get('RELEASES_BASE_PATH', '/var/cache/binpkgs-releases')
+BINHOST_SYMLINK_PATH = os.environ.get('BINHOST_SYMLINK_PATH', '/var/cache/binpkgs')
+
 # Binhost configuration (primary = seasonal, secondary = always-on)
 BINHOST_PRIMARY_IP = os.environ.get('BINHOST_PRIMARY_IP', '10.0.0.199')
 BINHOST_SECONDARY_IP = os.environ.get('BINHOST_SECONDARY_IP', '100.114.16.118')

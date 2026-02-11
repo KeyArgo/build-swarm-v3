@@ -98,6 +98,87 @@ def api_post(path: str, data: dict = None) -> dict:
         _connection_error(e)
 
 
+def _resolve_admin_url():
+    """Resolve admin dashboard URL (port 8093)."""
+    cp_url = _resolve_url()
+    # Replace port with admin port
+    return cp_url.rsplit(':', 1)[0] + ':8093'
+
+
+def _get_admin_key():
+    """Load admin key from env or key files."""
+    key = os.environ.get('SWARM_ADMIN_KEY') or os.environ.get('ADMIN_SECRET')
+    if key:
+        return key
+    for path in ['/etc/build-swarm/admin.key',
+                 os.path.expanduser('~/.local/share/build-swarm-v3/admin.key')]:
+        try:
+            with open(path) as f:
+                key = f.read().strip()
+                if key:
+                    return key
+        except (FileNotFoundError, PermissionError):
+            continue
+    print(f'{C.RED}Error:{C.RESET} No admin key found. Set SWARM_ADMIN_KEY or create /etc/build-swarm/admin.key')
+    sys.exit(1)
+
+
+def admin_get(path: str, params: dict = None) -> dict:
+    """GET request to the admin API (port 8093 with auth)."""
+    url = f'{_resolve_admin_url()}{path}'
+    if params:
+        query = '&'.join(f'{k}={v}' for k, v in params.items())
+        url = f'{url}?{query}'
+    try:
+        req = urllib.request.Request(url)
+        req.add_header('Accept', 'application/json')
+        req.add_header('X-Admin-Key', _get_admin_key())
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.URLError as e:
+        _connection_error(e)
+
+
+def admin_post(path: str, data: dict = None) -> dict:
+    """POST request to the admin API (port 8093 with auth)."""
+    url = f'{_resolve_admin_url()}{path}'
+    body = json.dumps(data or {}).encode()
+    try:
+        req = urllib.request.Request(url, data=body, method='POST')
+        req.add_header('Content-Type', 'application/json')
+        req.add_header('Accept', 'application/json')
+        req.add_header('X-Admin-Key', _get_admin_key())
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read().decode())
+            return err
+        except Exception:
+            _connection_error(e)
+    except urllib.error.URLError as e:
+        _connection_error(e)
+
+
+def admin_delete(path: str) -> dict:
+    """DELETE request to the admin API (port 8093 with auth)."""
+    url = f'{_resolve_admin_url()}{path}'
+    try:
+        req = urllib.request.Request(url, method='DELETE')
+        req.add_header('Accept', 'application/json')
+        req.add_header('X-Admin-Key', _get_admin_key())
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read().decode())
+            return err
+        except Exception:
+            _connection_error(e)
+    except urllib.error.URLError as e:
+        _connection_error(e)
+
+
 def _connection_error(error):
     """Print a clear error message when the server is unreachable."""
     resolved = _resolve_url()
@@ -1552,6 +1633,188 @@ def cmd_monitor(args):
     curses.wrapper(_monitor_main)
 
 
+# ── Release Commands ─────────────────────────────────────────────────────────
+
+def cmd_release(args):
+    """Dispatch release subcommands."""
+    subcmd = getattr(args, 'release_command', None)
+    if not subcmd:
+        print(f'{C.RED}Error:{C.RESET} Specify: create, list, show, promote, rollback, archive, delete, diff, migrate')
+        sys.exit(1)
+
+    dispatch = {
+        'create':  cmd_release_create,
+        'list':    cmd_release_list,
+        'show':    cmd_release_show,
+        'promote': cmd_release_promote,
+        'rollback': cmd_release_rollback,
+        'archive': cmd_release_archive,
+        'delete':  cmd_release_delete,
+        'diff':    cmd_release_diff,
+        'migrate': cmd_release_migrate,
+    }
+    fn = dispatch.get(subcmd)
+    if fn:
+        fn(args)
+    else:
+        print(f'{C.RED}Error:{C.RESET} Unknown release command: {subcmd}')
+        sys.exit(1)
+
+
+def cmd_release_list(args):
+    """List all releases."""
+    data = admin_get('/admin/api/releases')
+    releases = data.get('releases', [])
+    print_header('Releases')
+    if not releases:
+        print(f'  {C.DIM}No releases found. Run: build-swarmv3 release migrate{C.RESET}')
+        return
+
+    # Header row
+    print(f'  {C.BOLD}{"Version":<20} {"Status":<10} {"Packages":>8} {"Size":>8}  {"Created":<20} {"Promoted":<20}{C.RESET}')
+    print(f'  {"─" * 90}')
+
+    for r in releases:
+        sc = status_color(r['status'])
+        marker = ' *' if r['status'] == 'active' else ''
+        promoted = fmt_timestamp(r.get('promoted_at')) if r.get('promoted_at') else '-'
+        print(f'  {sc}{r["version"]:<20}{C.RESET} '
+              f'{sc}{r["status"]:<10}{C.RESET} '
+              f'{r.get("package_count", 0):>8} '
+              f'{r.get("size_mb", 0):>7.0f}M  '
+              f'{fmt_timestamp(r.get("created_at")):<20} '
+              f'{promoted:<20}'
+              f'{marker}')
+
+
+def cmd_release_create(args):
+    """Create a new release from staging."""
+    data = {}
+    if hasattr(args, 'name') and args.name:
+        data['version'] = args.name
+    if hasattr(args, 'notes') and args.notes:
+        data['notes'] = args.notes
+    result = admin_post('/admin/api/releases', data)
+    if result.get('status') == 'ok':
+        print_header('Release Created')
+        print_kv('Version', result['version'], C.BGREEN)
+        print_kv('Packages', result.get('package_count', 0))
+        print_kv('Size', f"{result.get('size_mb', 0)} MB")
+        print_kv('Path', result.get('path', '-'), C.DIM)
+    else:
+        print(f'{C.RED}Error:{C.RESET} {result.get("error", "Unknown error")}')
+        sys.exit(1)
+
+
+def cmd_release_show(args):
+    """Show release details."""
+    result = admin_get(f'/admin/api/releases/{args.version}')
+    if result.get('error'):
+        print(f'{C.RED}Error:{C.RESET} {result["error"]}')
+        sys.exit(1)
+    print_header(f'Release: {args.version}')
+    sc = status_color(result.get('status', ''))
+    print_kv('Version', result['version'], C.BGREEN)
+    if result.get('name'):
+        print_kv('Name', result['name'])
+    print_kv('Status', f'{sc}{result["status"]}{C.RESET}')
+    print_kv('Packages', result.get('package_count', 0))
+    print_kv('Size', f"{result.get('size_mb', 0)} MB")
+    print_kv('Path', result.get('path', '-'), C.DIM)
+    print_kv('Created', fmt_timestamp(result.get('created_at')))
+    if result.get('promoted_at'):
+        print_kv('Promoted', fmt_timestamp(result['promoted_at']))
+    if result.get('notes'):
+        print_kv('Notes', result['notes'])
+
+
+def cmd_release_promote(args):
+    """Promote a release to active."""
+    result = admin_post(f'/admin/api/releases/{args.version}/promote')
+    if result.get('status') == 'ok':
+        print(f'{C.BGREEN}Promoted{C.RESET} {args.version} to active')
+        if result.get('previous'):
+            print(f'  Previous: {result["previous"]} → archived')
+    else:
+        print(f'{C.RED}Error:{C.RESET} {result.get("error", "Unknown error")}')
+        sys.exit(1)
+
+
+def cmd_release_rollback(args):
+    """Rollback to previous release."""
+    result = admin_post('/admin/api/releases/rollback')
+    if result.get('status') == 'ok':
+        print(f'{C.BGREEN}Rolled back{C.RESET} to {result.get("version", "previous")}')
+    else:
+        print(f'{C.RED}Error:{C.RESET} {result.get("error", "Unknown error")}')
+        sys.exit(1)
+
+
+def cmd_release_archive(args):
+    """Archive a release."""
+    result = admin_post(f'/admin/api/releases/{args.version}/archive')
+    if result.get('status') == 'ok':
+        print(f'{C.YELLOW}Archived{C.RESET} {args.version}')
+    else:
+        print(f'{C.RED}Error:{C.RESET} {result.get("error", "Unknown error")}')
+        sys.exit(1)
+
+
+def cmd_release_delete(args):
+    """Delete an archived release."""
+    result = admin_delete(f'/admin/api/releases/{args.version}')
+    if result.get('status') == 'ok':
+        print(f'{C.RED}Deleted{C.RESET} {args.version}')
+    else:
+        print(f'{C.RED}Error:{C.RESET} {result.get("error", "Unknown error")}')
+        sys.exit(1)
+
+
+def cmd_release_diff(args):
+    """Compare two releases."""
+    data = admin_get('/admin/api/releases/diff',
+                     {'from': args.from_version, 'to': args.to_version})
+    if data.get('error'):
+        print(f'{C.RED}Error:{C.RESET} {data["error"]}')
+        sys.exit(1)
+
+    summary = data.get('summary', {})
+    print_header(f'Diff: {args.from_version} → {args.to_version}')
+    print_kv('Added', summary.get('added', 0), C.BGREEN)
+    print_kv('Removed', summary.get('removed', 0), C.BRED)
+    print_kv('Changed', summary.get('changed', 0), C.BYELLOW)
+    print_kv('Unchanged', summary.get('unchanged', 0), C.DIM)
+
+    if data.get('added'):
+        print(f'\n  {C.BGREEN}+ Added:{C.RESET}')
+        for p in data['added']:
+            print(f'    {p["category"]}/{p["package"]}-{p["version"]}')
+
+    if data.get('removed'):
+        print(f'\n  {C.BRED}- Removed:{C.RESET}')
+        for p in data['removed']:
+            print(f'    {p["category"]}/{p["package"]}-{p["version"]}')
+
+    if data.get('changed'):
+        print(f'\n  {C.BYELLOW}~ Changed:{C.RESET}')
+        for p in data['changed']:
+            print(f'    {p["category"]}/{p["package"]}: {p["from_version"]} → {p["to_version"]}')
+
+
+def cmd_release_migrate(args):
+    """One-time migration to release-based layout."""
+    result = admin_post('/admin/api/releases/migrate')
+    if result.get('status') == 'ok':
+        print_header('Migration Complete')
+        print_kv('Version', result['version'], C.BGREEN)
+        print_kv('Packages', result.get('package_count', 0))
+        print_kv('Size', f"{result.get('size_mb', 0)} MB")
+        print_kv('Symlink', result.get('symlink', '-'), C.DIM)
+    else:
+        print(f'{C.RED}Error:{C.RESET} {result.get("error", "Unknown error")}')
+        sys.exit(1)
+
+
 # ── Argument Parser ──────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1697,6 +1960,37 @@ Environment:
     p_create.add_argument('--list-backends', action='store_true',
                           help='List available backends and exit')
 
+    # release
+    p_release = sub.add_parser('release', help='Manage binary package releases')
+    release_sub = p_release.add_subparsers(dest='release_command', help='Release sub-command')
+
+    release_sub.add_parser('list', help='List all releases')
+
+    p_rc = release_sub.add_parser('create', help='Create a new release from staging')
+    p_rc.add_argument('--name', type=str, default=None,
+                      help='Version name (default: auto YYYY.MM.DD)')
+    p_rc.add_argument('--notes', type=str, default=None, help='Release notes')
+
+    p_rs = release_sub.add_parser('show', help='Show release details')
+    p_rs.add_argument('version', help='Release version to show')
+
+    p_rp = release_sub.add_parser('promote', help='Promote a release to active')
+    p_rp.add_argument('version', help='Release version to promote')
+
+    release_sub.add_parser('rollback', help='Switch to previous release')
+
+    p_ra = release_sub.add_parser('archive', help='Archive a release')
+    p_ra.add_argument('version', help='Release version to archive')
+
+    p_rd = release_sub.add_parser('delete', help='Delete an archived release')
+    p_rd.add_argument('version', help='Release version to delete')
+
+    p_rdiff = release_sub.add_parser('diff', help='Compare two releases')
+    p_rdiff.add_argument('from_version', help='Source release version')
+    p_rdiff.add_argument('to_version', help='Target release version')
+
+    release_sub.add_parser('migrate', help='One-time migration to release-based layout')
+
     # switch
     p_switch = sub.add_parser('switch',
                               help='Switch drones between v2 and v3 control planes')
@@ -1744,6 +2038,8 @@ def main():
         else:
             print(f'{C.RED}Error:{C.RESET} Specify a queue sub-command: add, list')
             sys.exit(1)
+    elif args.command == 'release':
+        cmd_release(args)
     elif args.command == 'drone':
         cmd_drone(args)
     elif args.command in commands:

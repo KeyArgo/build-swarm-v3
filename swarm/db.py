@@ -71,6 +71,31 @@ class SwarmDB:
         except Exception as e:
             log.debug(f"Migration note: {e}")
 
+        # Create releases table if missing (v3.1.1+)
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS releases (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    version TEXT UNIQUE NOT NULL,
+                    name TEXT,
+                    status TEXT DEFAULT 'staging'
+                        CHECK(status IN ('staging','active','archived','deleted')),
+                    package_count INTEGER DEFAULT 0,
+                    size_mb REAL DEFAULT 0,
+                    path TEXT NOT NULL,
+                    created_at REAL DEFAULT (strftime('%s','now')),
+                    promoted_at REAL,
+                    archived_at REAL,
+                    created_by TEXT,
+                    notes TEXT
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_releases_status ON releases(status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_releases_version ON releases(version)")
+            conn.commit()
+        except Exception as e:
+            log.debug(f"Releases migration note: {e}")
+
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         """Execute SQL with automatic retry on lock."""
         conn = self._get_conn()

@@ -45,7 +45,7 @@
     <button class="tab active" data-tab="overview" role="tab">Overview</button>
     <button class="tab" data-tab="fleet" role="tab">Fleet</button>
     <button class="tab" data-tab="drone-mgmt" role="tab">Drone Mgmt</button>
-    <button class="tab" data-tab="binhost" role="tab">Binhost</button>
+    <button class="tab" data-tab="binhost" role="tab">Releases</button>
     <button class="tab" data-tab="queue" role="tab">Queue</button>
     <button class="tab" data-tab="history" role="tab">History</button>
     <button class="tab" data-tab="topology" role="tab">Topology</button>
@@ -431,31 +431,80 @@
 
   <!-- ═══════════════════ BINHOST TAB ═══════════════════ -->
   <div class="tab-content" id="tab-binhost" role="tabpanel">
+    <!-- Release Status Cards -->
     <div class="cards-row">
-      <div class="stat-card" id="stat-binhost-primary-status">
-        <div class="label">Primary (proxmox-io)</div>
-        <div class="value green">-</div>
-      </div>
-      <div class="stat-card" id="stat-binhost-secondary-status">
-        <div class="label">Secondary (proxmox-titan)</div>
-        <div class="value">-</div>
-      </div>
-      <div class="stat-card" id="stat-binhost-active">
-        <div class="label">Active Binhost</div>
+      <div class="stat-card" id="stat-rel-active">
+        <div class="label">Active Release</div>
         <div class="value cyan">-</div>
       </div>
-    </div>
-    <div class="section-card">
-      <h3>Binhost Controls</h3>
-      <p style="color:var(--text-dim);font-size:0.8rem;margin-bottom:1rem">
-        Primary: <span class="mono" id="binhost-primary-ip">-</span> (seasonal: fall/winter/spring) &mdash;
-        Secondary: <span class="mono" id="binhost-secondary-ip">-</span> (always available)
-      </p>
-      <div class="control-panel">
-        <button class="btn" onclick="binhostAction('flip')">Flip Active Binhost</button>
-        <button class="btn" onclick="binhostAction('rsync')">Sync Primary &rarr; Secondary</button>
+      <div class="stat-card" id="stat-rel-staging">
+        <div class="label">Staging Packages</div>
+        <div class="value">-</div>
       </div>
-      <div id="binhost-result" class="ctrl-result"></div>
+      <div class="stat-card" id="stat-rel-total">
+        <div class="label">Total Releases</div>
+        <div class="value">-</div>
+      </div>
+      <div class="stat-card" id="stat-rel-disk">
+        <div class="label">Disk Usage</div>
+        <div class="value">-</div>
+      </div>
+    </div>
+
+    <!-- Release Actions -->
+    <div class="section-card">
+      <h3>Release Actions</h3>
+      <div class="control-panel">
+        <button class="btn success" onclick="createRelease()">Create Release from Staging</button>
+        <button class="btn" onclick="rollbackRelease()">Rollback to Previous</button>
+        <button class="btn" onclick="migrateReleases()" id="migrate-btn" style="display:none">Migrate to Release System</button>
+      </div>
+      <div id="release-result" class="ctrl-result"></div>
+    </div>
+
+    <!-- All Releases Table -->
+    <div class="section-card">
+      <h3>All Releases</h3>
+      <div class="table-wrap" style="max-height:400px;overflow-y:auto">
+        <table>
+          <thead>
+            <tr>
+              <th>Version</th>
+              <th>Status</th>
+              <th>Packages</th>
+              <th>Size</th>
+              <th>Created</th>
+              <th>Promoted</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="releases-tbody">
+            <tr><td colspan="7" class="empty-state">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Package Browser -->
+    <div class="section-card" id="release-pkg-browser" style="display:none">
+      <h3>Packages in <span id="release-pkg-version" class="mono cyan">-</span>
+        <button class="btn" onclick="closePackageBrowser()" style="float:right;font-size:0.7rem">Close</button>
+      </h3>
+      <div class="table-wrap" style="max-height:500px;overflow-y:auto">
+        <table>
+          <thead><tr><th>Category</th><th>Package</th><th>Version</th><th>Size</th></tr></thead>
+          <tbody id="release-pkg-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Diff Viewer -->
+    <div class="section-card" id="release-diff-viewer" style="display:none">
+      <h3>Diff: <span id="diff-from" class="mono">-</span> &rarr; <span id="diff-to" class="mono">-</span>
+        <button class="btn" onclick="closeDiffViewer()" style="float:right;font-size:0.7rem">Close</button>
+      </h3>
+      <div class="cards-row" id="diff-stats"></div>
+      <div id="diff-content" style="max-height:400px;overflow-y:auto"></div>
     </div>
   </div>
 

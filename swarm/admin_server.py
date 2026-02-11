@@ -265,6 +265,19 @@ class AdminHandler(BaseHTTPRequestHandler):
                 self.send_error_json(500, 'Database not available')
             return
 
+        # Release deletion
+        if path.startswith('/admin/api/releases/'):
+            version = path.split('/')[-1]
+            if cp.release_mgr:
+                result = cp.release_mgr.delete_release(version)
+                if result.get('status') == 'ok':
+                    self.send_json(result)
+                else:
+                    self.send_error_json(400, result.get('error', 'Delete failed'))
+            else:
+                self.send_error_json(500, 'Release manager not available')
+            return
+
         self.send_error_json(404, f'Unknown admin endpoint: {path}')
 
     # ── Admin GET endpoints ──
@@ -346,6 +359,48 @@ class AdminHandler(BaseHTTPRequestHandler):
                     })
             else:
                 self.send_error_json(500, 'Database not available')
+            return
+
+        # ── Releases ──
+
+        if path == '/admin/api/releases':
+            if cp.release_mgr:
+                self.send_json({'releases': cp.release_mgr.list_releases()})
+            else:
+                self.send_json({'releases': []})
+            return
+
+        if path == '/admin/api/releases/diff':
+            from_v = params.get('from', [None])[0]
+            to_v = params.get('to', [None])[0]
+            if not from_v or not to_v:
+                self.send_error_json(400, 'Both "from" and "to" parameters required')
+                return
+            if cp.release_mgr:
+                self.send_json(cp.release_mgr.diff_releases(from_v, to_v))
+            else:
+                self.send_error_json(500, 'Release manager not available')
+            return
+
+        if path.startswith('/admin/api/releases/') and path.endswith('/packages'):
+            version = path.split('/')[-2]
+            if cp.release_mgr:
+                pkgs = cp.release_mgr.get_release_packages(version)
+                self.send_json({'version': version, 'packages': pkgs})
+            else:
+                self.send_error_json(500, 'Release manager not available')
+            return
+
+        if path.startswith('/admin/api/releases/'):
+            version = path.split('/')[-1]
+            if cp.release_mgr:
+                release = cp.release_mgr.get_release(version)
+                if release:
+                    self.send_json(release)
+                else:
+                    self.send_error_json(404, f'Release not found: {version}')
+            else:
+                self.send_error_json(500, 'Release manager not available')
             return
 
         # V2 proxy (GET endpoints)
@@ -431,6 +486,52 @@ class AdminHandler(BaseHTTPRequestHandler):
             drone_name = path.split('/')[4]
             timer = body.get('timer_minutes', 0)
             self.send_json({'status': 'not_implemented', 'drone': drone_name, 'timer': timer, 'message': 'Drone unlock endpoint — Phase 4'})
+            return
+
+        # ── Releases ──
+
+        if path == '/admin/api/releases':
+            if not cp.release_mgr:
+                self.send_error_json(500, 'Release manager not available')
+                return
+            result = cp.release_mgr.create_release(
+                version=body.get('version'),
+                name=body.get('name'),
+                notes=body.get('notes'),
+                created_by=body.get('created_by', 'admin'),
+            )
+            status_code = 201 if result.get('status') == 'ok' else 400
+            self.send_json(result, status_code)
+            return
+
+        if path == '/admin/api/releases/rollback':
+            if cp.release_mgr:
+                self.send_json(cp.release_mgr.rollback())
+            else:
+                self.send_error_json(500, 'Release manager not available')
+            return
+
+        if path == '/admin/api/releases/migrate':
+            if cp.release_mgr:
+                self.send_json(cp.release_mgr.migrate_to_release_system())
+            else:
+                self.send_error_json(500, 'Release manager not available')
+            return
+
+        if path.startswith('/admin/api/releases/') and path.endswith('/promote'):
+            version = path.split('/')[-2]
+            if cp.release_mgr:
+                self.send_json(cp.release_mgr.promote_release(version))
+            else:
+                self.send_error_json(500, 'Release manager not available')
+            return
+
+        if path.startswith('/admin/api/releases/') and path.endswith('/archive'):
+            version = path.split('/')[-2]
+            if cp.release_mgr:
+                self.send_json(cp.release_mgr.archive_release(version))
+            else:
+                self.send_error_json(500, 'Release manager not available')
             return
 
         # Binhost stubs (Phase 5)

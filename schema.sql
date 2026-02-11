@@ -143,3 +143,22 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
+
+-- Releases: versioned snapshots of binary packages
+CREATE TABLE IF NOT EXISTS releases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    version TEXT UNIQUE NOT NULL,           -- e.g. '2026.02.11' or 'pre-kde6'
+    name TEXT,                              -- optional friendly label
+    status TEXT DEFAULT 'staging'
+        CHECK(status IN ('staging','active','archived','deleted')),
+    package_count INTEGER DEFAULT 0,
+    size_mb REAL DEFAULT 0,
+    path TEXT NOT NULL,                     -- absolute path to release directory
+    created_at REAL DEFAULT (strftime('%s','now')),
+    promoted_at REAL,
+    archived_at REAL,
+    created_by TEXT,
+    notes TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_releases_status ON releases(status);
+CREATE INDEX IF NOT EXISTS idx_releases_version ON releases(version);

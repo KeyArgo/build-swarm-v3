@@ -734,25 +734,221 @@ async function addNewDroneConfig() {
 // ── Binhost tab ──
 
 async function refreshBinhost() {
-  const info = await adminGet('/system/info');
-  if (info) {
-    setText('#binhost-primary-ip', info.binhost_primary_ip || '-');
-    setText('#binhost-secondary-ip', info.binhost_secondary_ip || '-');
+  const data = await adminGet('/releases');
+  if (!data) return;
+
+  const releases = data.releases || [];
+  const active = releases.find(r => r.status === 'active');
+  const staging = await v3Get('/binhost-stats');
+
+  // Update stat cards
+  updateStatCard('rel-active', active ? active.version : 'None', active ? 'cyan' : 'red');
+  updateStatCard('rel-staging', staging ? staging.packages : '-', '');
+  updateStatCard('rel-total', releases.length, '');
+
+  const totalMB = releases.reduce((sum, r) => sum + (r.size_mb || 0), 0);
+  updateStatCard('rel-disk', totalMB > 1024 ? `${(totalMB/1024).toFixed(1)} GB` : `${Math.round(totalMB)} MB`, '');
+
+  // Show migrate button if no releases exist
+  const migrateBtn = $('#migrate-btn');
+  if (migrateBtn) migrateBtn.style.display = releases.length === 0 ? 'inline-block' : 'none';
+
+  // Render releases table
+  const tbody = $('#releases-tbody');
+  if (!tbody) return;
+
+  if (releases.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" class="empty-state">No releases. Click "Migrate to Release System" to start.</td></tr>';
+    return;
   }
-  // For now show config-based info (SSH probing comes in Phase 5 backend)
-  updateStatCard('binhost-primary-status', 'Configured', 'green');
-  updateStatCard('binhost-secondary-status', 'Configured', 'green');
-  updateStatCard('binhost-active', 'Primary', 'cyan');
+
+  tbody.innerHTML = releases.map(r => {
+    const statusClass = r.status === 'active' ? 'online' :
+                        r.status === 'staging' ? 'v3' :
+                        r.status === 'archived' ? 'v2' : 'offline';
+    let actions = '';
+    if (r.status === 'staging') {
+      actions += `<button class="btn success" onclick="promoteRelease('${esc(r.version)}')">Promote</button> `;
+      actions += `<button class="btn danger" onclick="deleteRelease('${esc(r.version)}')">Delete</button> `;
+    } else if (r.status === 'archived') {
+      actions += `<button class="btn" onclick="promoteRelease('${esc(r.version)}')">Promote</button> `;
+      actions += `<button class="btn danger" onclick="deleteRelease('${esc(r.version)}')">Delete</button> `;
+    } else if (r.status === 'active') {
+      actions += `<button class="btn" onclick="archiveRelease('${esc(r.version)}')">Archive</button> `;
+    }
+    actions += `<button class="btn" onclick="browseRelease('${esc(r.version)}')">Browse</button>`;
+    if (active && r.version !== active.version) {
+      actions += ` <button class="btn" onclick="diffReleases('${esc(active.version)}','${esc(r.version)}')">Diff</button>`;
+    }
+    return `<tr>
+      <td><strong>${esc(r.version)}</strong>${r.name ? `<br><span style="color:var(--text-dim);font-size:0.7rem">${esc(r.name)}</span>` : ''}</td>
+      <td><span class="badge ${statusClass}">${r.status}</span></td>
+      <td>${r.package_count || 0}</td>
+      <td>${r.size_mb ? Math.round(r.size_mb) + ' MB' : '-'}</td>
+      <td style="white-space:nowrap">${fmtTime(r.created_at)}</td>
+      <td style="white-space:nowrap">${r.promoted_at ? fmtTime(r.promoted_at) : '-'}</td>
+      <td style="white-space:nowrap">${actions}</td>
+    </tr>`;
+  }).join('');
 }
 
-async function binhostAction(action) {
-  const el = $('#binhost-result');
-  if (el) { el.textContent = `${action}...`; el.style.color = 'var(--cyan)'; }
-  const result = await adminPost(`/binhost/${action}`);
-  if (el) {
-    el.textContent = JSON.stringify(result);
-    el.style.color = result?.status === 'not_implemented' ? 'var(--amber)' : 'var(--green)';
+function esc(s) { return String(s).replace(/'/g, "\\'").replace(/"/g, '&quot;').replace(/</g, '&lt;'); }
+
+async function createRelease() {
+  const name = prompt('Release version (leave blank for auto YYYY.MM.DD):');
+  if (name === null) return;
+  const notes = prompt('Release notes (optional):');
+  const body = {};
+  if (name) body.version = name;
+  if (notes) body.notes = notes;
+  showReleaseResult('Creating release...', 'cyan');
+  const result = await adminPost('/releases', body);
+  if (result && result.status === 'ok') {
+    showReleaseResult(`Created release ${result.version} (${result.package_count} packages, ${result.size_mb} MB)`, 'green');
+  } else {
+    showReleaseResult(`Error: ${result?.error || 'Failed'}`, 'red');
   }
+  setTimeout(refresh, 500);
+}
+
+async function promoteRelease(version) {
+  if (!confirm(`Promote release "${version}" to active? This will switch what nginx serves.`)) return;
+  showReleaseResult(`Promoting ${version}...`, 'cyan');
+  const result = await adminPost(`/releases/${encodeURIComponent(version)}/promote`);
+  if (result && result.status === 'ok') {
+    showReleaseResult(`Promoted ${version} to active`, 'green');
+  } else {
+    showReleaseResult(`Error: ${result?.error || 'Failed'}`, 'red');
+  }
+  setTimeout(refresh, 500);
+}
+
+async function archiveRelease(version) {
+  showReleaseResult(`Archiving ${version}...`, 'cyan');
+  const result = await adminPost(`/releases/${encodeURIComponent(version)}/archive`);
+  showReleaseResult(result?.status === 'ok' ? `Archived ${version}` : `Error: ${result?.error || 'Failed'}`,
+                    result?.status === 'ok' ? 'green' : 'red');
+  setTimeout(refresh, 500);
+}
+
+async function deleteRelease(version) {
+  if (!confirm(`Delete release "${version}"? This removes the directory from disk.`)) return;
+  showReleaseResult(`Deleting ${version}...`, 'cyan');
+  const result = await adminDelete(`/releases/${encodeURIComponent(version)}`);
+  showReleaseResult(result?.status === 'ok' ? `Deleted ${version}` : `Error: ${result?.error || 'Failed'}`,
+                    result?.status === 'ok' ? 'green' : 'red');
+  setTimeout(refresh, 500);
+}
+
+async function rollbackRelease() {
+  if (!confirm('Rollback to the previous active release?')) return;
+  showReleaseResult('Rolling back...', 'cyan');
+  const result = await adminPost('/releases/rollback');
+  showReleaseResult(result?.status === 'ok' ? `Rolled back to ${result.version}` : `Error: ${result?.error || 'Failed'}`,
+                    result?.status === 'ok' ? 'green' : 'red');
+  setTimeout(refresh, 500);
+}
+
+async function migrateReleases() {
+  if (!confirm('Migrate /var/cache/binpkgs to the release-based system? This is a one-time operation.')) return;
+  showReleaseResult('Migrating...', 'cyan');
+  const result = await adminPost('/releases/migrate');
+  if (result?.status === 'ok') {
+    showReleaseResult(`Migrated: initial release (${result.package_count} packages, ${result.size_mb} MB)`, 'green');
+  } else {
+    showReleaseResult(`Error: ${result?.error || 'Failed'}`, 'red');
+  }
+  setTimeout(refresh, 1000);
+}
+
+async function browseRelease(version) {
+  const data = await adminGet(`/releases/${encodeURIComponent(version)}/packages`);
+  if (!data) return;
+  const browser = $('#release-pkg-browser');
+  if (browser) browser.style.display = 'block';
+  setText('#release-pkg-version', version);
+  const tbody = $('#release-pkg-tbody');
+  const packages = data.packages || [];
+  if (!tbody) return;
+  if (packages.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="4" class="empty-state">No packages found</td></tr>';
+    return;
+  }
+  tbody.innerHTML = packages.map(p => `<tr>
+    <td>${esc(p.category)}</td>
+    <td>${esc(p.package)}</td>
+    <td class="mono">${esc(p.version)}</td>
+    <td>${(p.size_bytes / 1048576).toFixed(1)} MB</td>
+  </tr>`).join('');
+}
+
+function closePackageBrowser() {
+  const el = $('#release-pkg-browser');
+  if (el) el.style.display = 'none';
+}
+
+async function diffReleases(from, to) {
+  const data = await adminGet(`/releases/diff?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`);
+  if (!data || data.error) return;
+  const viewer = $('#release-diff-viewer');
+  if (viewer) viewer.style.display = 'block';
+  setText('#diff-from', from);
+  setText('#diff-to', to);
+
+  const s = data.summary || {};
+  const statsEl = $('#diff-stats');
+  if (statsEl) {
+    statsEl.innerHTML = `
+      <div class="stat-card"><div class="label">Added</div><div class="value green">${s.added || 0}</div></div>
+      <div class="stat-card"><div class="label">Removed</div><div class="value red">${s.removed || 0}</div></div>
+      <div class="stat-card"><div class="label">Changed</div><div class="value amber">${s.changed || 0}</div></div>
+      <div class="stat-card"><div class="label">Unchanged</div><div class="value">${s.unchanged || 0}</div></div>
+    `;
+  }
+
+  let html = '';
+  if (data.added && data.added.length > 0) {
+    html += '<h4 style="color:var(--green)">+ Added</h4><ul>';
+    data.added.forEach(p => { html += `<li>${esc(p.category)}/${esc(p.package)}-${esc(p.version)}</li>`; });
+    html += '</ul>';
+  }
+  if (data.removed && data.removed.length > 0) {
+    html += '<h4 style="color:var(--red)">- Removed</h4><ul>';
+    data.removed.forEach(p => { html += `<li>${esc(p.category)}/${esc(p.package)}-${esc(p.version)}</li>`; });
+    html += '</ul>';
+  }
+  if (data.changed && data.changed.length > 0) {
+    html += '<h4 style="color:var(--amber)">~ Changed</h4><ul>';
+    data.changed.forEach(p => { html += `<li>${esc(p.category)}/${esc(p.package)}: ${esc(p.from_version)} &rarr; ${esc(p.to_version)}</li>`; });
+    html += '</ul>';
+  }
+  if (!html) html = '<p style="color:var(--text-dim)">No differences found</p>';
+  const contentEl = $('#diff-content');
+  if (contentEl) contentEl.innerHTML = html;
+}
+
+function closeDiffViewer() {
+  const el = $('#release-diff-viewer');
+  if (el) el.style.display = 'none';
+}
+
+async function adminDelete(path) {
+  try {
+    const res = await fetch(`${ADMIN_API}${path}`, {
+      method: 'DELETE',
+      headers: { 'Accept': 'application/json', 'X-Admin-Key': adminKey },
+    });
+    if (res.status === 401) { showLogin(); return null; }
+    if (!res.ok) { console.warn('adminDelete failed:', path, res.status); return null; }
+    return await res.json();
+  } catch (e) { console.error('adminDelete error:', path, e); return null; }
+}
+
+function showReleaseResult(message, color) {
+  const el = $('#release-result');
+  if (!el) return;
+  el.textContent = message;
+  el.style.color = `var(--${color})`;
 }
 
 // ── Queue tab ──

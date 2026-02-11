@@ -30,6 +30,7 @@ log = logging.getLogger('swarm-v3')
 db: SwarmDB = None
 health_monitor: DroneHealthMonitor = None
 scheduler: Scheduler = None
+release_mgr = None  # ReleaseManager, initialized in start()
 
 
 def get_self_ip() -> str:
@@ -462,6 +463,12 @@ class V3Handler(BaseHTTPRequestHandler):
                     'data': {'packages': len(pkgs), 'size_mb': round(total_size / 1048576)}
                 }
             self.send_json(_binhost_cache['data'])
+
+        elif path == '/api/v1/binhost/status':
+            if release_mgr:
+                self.send_json(release_mgr.get_binhost_status())
+            else:
+                self.send_json(_binhost_cache.get('data', {}))
 
         # ── Build Stats by Package (v3.1) ──
         elif path == '/api/v1/build-stats/by-package':
@@ -1135,7 +1142,7 @@ def _session_monitor():
 
 def start(db_path: str = None, port: int = None):
     """Start the v3 control plane."""
-    global db, health_monitor, scheduler, _start_time
+    global db, health_monitor, scheduler, release_mgr, _start_time
 
     _start_time = time.time()
     port = port or cfg.CONTROL_PLANE_PORT
@@ -1151,6 +1158,10 @@ def start(db_path: str = None, port: int = None):
 
     # v3.1: Initialize persistent events (hydrate ring buffer from SQLite)
     init_events(db)
+
+    # v3.1.1: Initialize release manager
+    from .releases import ReleaseManager
+    release_mgr = ReleaseManager(db)
 
     log.info(f"=== Build Swarm v3 Control Plane v{__version__} ===")
     log.info(f"Database: {db_path}")
