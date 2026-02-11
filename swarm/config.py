@@ -52,6 +52,22 @@ SWEEPER_THRESHOLD = int(os.environ.get('SWEEPER_THRESHOLD', MAX_DRONE_FAILURES))
 STAGING_PATH = os.environ.get('STAGING_PATH', '/var/cache/binpkgs-v3-staging')
 BINHOST_PATH = os.environ.get('BINHOST_PATH', '/var/cache/binpkgs-v3')
 
+# Admin dashboard
+ADMIN_PORT = int(os.environ.get('ADMIN_PORT', 8093))
+ADMIN_SECRET = os.environ.get('ADMIN_SECRET', '')
+ADMIN_STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'admin')
+
+# Binhost configuration (primary = seasonal, secondary = always-on)
+BINHOST_PRIMARY_IP = os.environ.get('BINHOST_PRIMARY_IP', '10.0.0.200')
+BINHOST_SECONDARY_IP = os.environ.get('BINHOST_SECONDARY_IP', '100.114.16.118')
+BINHOST_PRIMARY_PATH = os.environ.get('BINHOST_PRIMARY_PATH', '/var/cache/binpkgs')
+BINHOST_SECONDARY_PATH = os.environ.get('BINHOST_SECONDARY_PATH', '/var/cache/binpkgs')
+BINHOST_PRIMARY_PORT = int(os.environ.get('BINHOST_PRIMARY_PORT', 80))
+BINHOST_SECONDARY_PORT = int(os.environ.get('BINHOST_SECONDARY_PORT', 80))
+
+# V2 gateway proxy
+V2_GATEWAY_URL = os.environ.get('V2_GATEWAY_URL', 'http://10.0.0.199:8090')
+
 # Control plane URL — auto-discover if not set
 KNOWN_HOSTS = ['localhost', '10.0.0.199']
 

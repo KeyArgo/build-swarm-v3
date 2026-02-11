@@ -95,6 +95,23 @@ class DroneHealthMonitor:
         if packages:
             log.info(f"[GROUNDED] Reclaimed {len(packages)} packages from {drone_name}")
 
+    def _build_ssh_cmd(self, drone_ip: str, drone_name: str = None, remote_cmd: str = '') -> list:
+        """Build an SSH command list using per-drone config from drone_config table."""
+        ssh_cfg = self.db.get_ssh_config(drone_name) if drone_name else {}
+        user = ssh_cfg.get('user') or 'root'
+        port = ssh_cfg.get('port') or 22
+        key_path = ssh_cfg.get('key_path')
+
+        cmd = ['ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no']
+        if port != 22:
+            cmd += ['-p', str(port)]
+        if key_path:
+            cmd += ['-i', key_path]
+        cmd.append(f'{user}@{drone_ip}')
+        if remote_cmd:
+            cmd.append(remote_cmd)
+        return cmd
+
     def restart_drone_service(self, drone_id: str, drone_ip: str):
         """Restart the swarm-drone service via SSH (less destructive than reboot).
 
@@ -108,13 +125,11 @@ class DroneHealthMonitor:
         def run_restart():
             try:
                 log.warning(f"[RESTART] Restarting swarm-drone on {drone_name} ({drone_ip})")
-                result = subprocess.run(
-                    ['ssh', '-o', 'ConnectTimeout=5',
-                     '-o', 'StrictHostKeyChecking=no',
-                     f'root@{drone_ip}',
-                     'rc-service swarm-drone restart 2>&1 || /opt/build-swarm/bin/swarm-drone &'],
-                    timeout=30, capture_output=True, text=True
+                cmd = self._build_ssh_cmd(
+                    drone_ip, drone_name,
+                    'rc-service swarm-drone restart 2>&1 || /opt/build-swarm/bin/swarm-drone &'
                 )
+                result = subprocess.run(cmd, timeout=30, capture_output=True, text=True)
                 if result.returncode == 0:
                     log.info(f"[RESTART] {drone_name} service restarted successfully")
                     add_event('control', f"{drone_name} service restarted via SSH",
@@ -147,12 +162,8 @@ class DroneHealthMonitor:
         def run_reboot():
             try:
                 log.warning(f"[REBOOT] Attempting reboot of {drone_name} ({drone_ip})")
-                subprocess.run(
-                    ['ssh', '-o', 'ConnectTimeout=5',
-                     '-o', 'StrictHostKeyChecking=no',
-                     f'root@{drone_ip}', 'reboot'],
-                    timeout=10, capture_output=True
-                )
+                cmd = self._build_ssh_cmd(drone_ip, drone_name, 'reboot')
+                subprocess.run(cmd, timeout=10, capture_output=True)
             except Exception as e:
                 log.error(f"[REBOOT] Failed for {drone_name}: {e}")
 
@@ -186,11 +197,8 @@ class DroneHealthMonitor:
                 "echo EMERGE=$(pgrep -c -f 'emerge.*ebuild' 2>/dev/null || echo 0);"
                 "echo UPTIME=$(cat /proc/uptime | cut -d' ' -f1)"
             )
-            proc = subprocess.run(
-                ['ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
-                 f'root@{drone_ip}', cmd],
-                timeout=15, capture_output=True, text=True
-            )
+            ssh_cmd = self._build_ssh_cmd(drone_ip, drone_name, cmd)
+            proc = subprocess.run(ssh_cmd, timeout=15, capture_output=True, text=True)
 
             if proc.returncode != 0:
                 result['status'] = 'unreachable'

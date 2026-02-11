@@ -402,6 +402,23 @@ class SwarmDB:
         """, (package,))
         return cursor.rowcount > 0
 
+    def unblock_package(self, package: str) -> bool:
+        """Unblock a single package, reset its failure count."""
+        cursor = self.execute("""
+            UPDATE queue SET status = 'needed', failure_count = 0,
+                error_message = NULL, assigned_to = NULL
+            WHERE package = ? AND status IN ('blocked', 'failed')
+        """, (package,))
+        return cursor.rowcount > 0
+
+    def block_package(self, package: str) -> bool:
+        """Block a single package (manual block)."""
+        cursor = self.execute("""
+            UPDATE queue SET status = 'blocked', error_message = 'manually blocked'
+            WHERE package = ? AND status NOT IN ('received', 'blocked')
+        """, (package,))
+        return cursor.rowcount > 0
+
     def unblock_all(self) -> int:
         """Unblock all blocked packages, reset failure counts."""
         cursor = self.execute("""
@@ -656,6 +673,68 @@ class SwarmDB:
             ORDER BY bucket
         """, (bucket_seconds, bucket_seconds, since))
         return [dict(r) for r in rows]
+
+    # ── Drone Config (admin-managed per-drone settings) ──────────────
+
+    def get_drone_config(self, node_name: str) -> Optional[dict]:
+        """Get admin config for a drone by name."""
+        row = self.fetchone("SELECT * FROM drone_config WHERE node_name = ?", (node_name,))
+        return dict(row) if row else None
+
+    def get_all_drone_configs(self) -> List[dict]:
+        """Get all drone configs."""
+        rows = self.fetchall("SELECT * FROM drone_config ORDER BY node_name")
+        return [dict(r) for r in rows]
+
+    def upsert_drone_config(self, node_name: str, **fields) -> dict:
+        """Create or update drone config. Only updates provided fields."""
+        existing = self.get_drone_config(node_name)
+
+        if existing:
+            # Update only provided fields
+            updates = []
+            values = []
+            for key, val in fields.items():
+                if key in ('node_name', 'created_at'):
+                    continue  # Don't update primary key or creation time
+                updates.append(f"{key} = ?")
+                values.append(val)
+            if updates:
+                updates.append("updated_at = strftime('%s','now')")
+                values.append(node_name)
+                sql = f"UPDATE drone_config SET {', '.join(updates)} WHERE node_name = ?"
+                self.execute(sql, tuple(values))
+        else:
+            # Insert new config with defaults
+            cols = ['node_name']
+            vals = [node_name]
+            placeholders = ['?']
+            for key, val in fields.items():
+                if key in ('node_name', 'created_at', 'updated_at'):
+                    continue
+                cols.append(key)
+                vals.append(val)
+                placeholders.append('?')
+            sql = f"INSERT INTO drone_config ({', '.join(cols)}) VALUES ({', '.join(placeholders)})"
+            self.execute(sql, tuple(vals))
+
+        return self.get_drone_config(node_name) or {'node_name': node_name}
+
+    def delete_drone_config(self, node_name: str):
+        """Delete drone config."""
+        self.execute("DELETE FROM drone_config WHERE node_name = ?", (node_name,))
+
+    def get_ssh_config(self, node_name: str) -> dict:
+        """Get SSH connection details for a drone. Falls back to defaults."""
+        config = self.get_drone_config(node_name)
+        if config:
+            return {
+                'user': config.get('ssh_user') or 'root',
+                'port': config.get('ssh_port') or 22,
+                'key_path': config.get('ssh_key_path'),
+                'password': config.get('ssh_password'),
+            }
+        return {'user': 'root', 'port': 22, 'key_path': None, 'password': None}
 
     # ── Utility ───────────────────────────────────────────────────────
 

@@ -267,6 +267,47 @@ else
     warn "portage_tree   timestamp not found"
 fi
 
+# ── 11. Bloat protection (package.mask + immutable files) ──
+MASK_FILE="/etc/portage/package.mask/drone-lockdown"
+LOCK_STATE_FILE="/etc/build-swarm/.lock-state"
+
+# Check package.mask exists
+if [ -f "$MASK_FILE" ]; then
+    MASK_PATTERNS=$(grep -c '^[^#]' "$MASK_FILE" 2>/dev/null || echo 0)
+    pass "package_mask   active ($MASK_PATTERNS forbidden patterns)"
+else
+    fail "package_mask   MISSING — forbidden packages can be installed! Run: drone-lock"
+fi
+
+# Check immutable flags on critical files
+IMMUTABLE_COUNT=0
+IMMUTABLE_EXPECTED=0
+for f in "$WORLD_FILE" /etc/portage/make.conf "$MASK_FILE" /etc/portage/package.use/swarm-drone /etc/portage/package.accept_keywords/swarm-drone; do
+    [ -f "$f" ] || continue
+    ((IMMUTABLE_EXPECTED++))
+    if lsattr "$f" 2>/dev/null | grep -q '^....i'; then
+        ((IMMUTABLE_COUNT++))
+    fi
+done
+
+if [ "$IMMUTABLE_COUNT" -eq "$IMMUTABLE_EXPECTED" ] && [ "$IMMUTABLE_EXPECTED" -gt 0 ]; then
+    pass "immutable      all $IMMUTABLE_COUNT critical files locked"
+elif [ "$IMMUTABLE_COUNT" -gt 0 ]; then
+    warn "immutable      $IMMUTABLE_COUNT/$IMMUTABLE_EXPECTED files locked (partially unlocked)"
+else
+    fail "immutable      NO files locked — drone is UNPROTECTED! Run: drone-lock"
+fi
+
+# Check lock state
+if [ -f "$LOCK_STATE_FILE" ]; then
+    LOCK_STATUS=$(cat "$LOCK_STATE_FILE")
+    if echo "$LOCK_STATUS" | grep -q '^unlocked'; then
+        warn "lock_state     $LOCK_STATUS"
+    else
+        pass "lock_state     $LOCK_STATUS"
+    fi
+fi
+
 # ── Summary ──
 echo ""
 TOTAL=$((PASS_COUNT + WARN_COUNT + FAIL_COUNT))

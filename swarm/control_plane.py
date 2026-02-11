@@ -791,10 +791,34 @@ class V3Handler(BaseHTTPRequestHandler):
             self.send_json({'status': 'active'})
 
         elif action == 'unblock':
-            count = db.unblock_all()
-            log.info(f"Unblocked {count} packages")
-            add_event('unblock', f"{count} packages unblocked", {'count': count})
-            self.send_json({'status': 'ok', 'unblocked': count})
+            package = data.get('package')
+            if package:
+                ok = db.unblock_package(package)
+                log.info(f"Unblock {package}: {'ok' if ok else 'not found/already needed'}")
+                self.send_json({'status': 'ok' if ok else 'no_change', 'package': package})
+            else:
+                count = db.unblock_all()
+                log.info(f"Unblocked {count} packages")
+                add_event('unblock', f"{count} packages unblocked", {'count': count})
+                self.send_json({'status': 'ok', 'unblocked': count})
+
+        elif action == 'block':
+            package = data.get('package')
+            if not package:
+                self.send_json({'error': 'block requires package'}, 400)
+                return
+            ok = db.block_package(package)
+            log.info(f"Block {package}: {'ok' if ok else 'not found'}")
+            self.send_json({'status': 'ok' if ok else 'no_change', 'package': package})
+
+        elif action == 'reclaim':
+            package = data.get('package')
+            if not package:
+                self.send_json({'error': 'reclaim requires package'}, 400)
+                return
+            ok = db.reclaim_package(package)
+            log.info(f"Reclaim {package}: {'ok' if ok else 'not delegated'}")
+            self.send_json({'status': 'ok' if ok else 'no_change', 'package': package})
 
         elif action == 'unground':
             drone_id = data.get('drone_id')
@@ -1082,6 +1106,19 @@ def start(db_path: str = None, port: int = None):
     threading.Thread(target=_protocol_prune_loop, daemon=True).start()
     threading.Thread(target=_drone_health_probe_loop, daemon=True).start()
     log.info("Background threads started (metrics, maintenance, session monitor, protocol/event prune, health probe)")
+
+    # Start admin dashboard server on secondary port
+    try:
+        from .admin_server import start_admin_server
+        admin_thread = threading.Thread(
+            target=start_admin_server,
+            args=(cfg.ADMIN_PORT,),
+            daemon=True,
+            name='admin-dashboard'
+        )
+        admin_thread.start()
+    except Exception as e:
+        log.warning(f"Admin dashboard failed to start: {e}")
 
     # Start HTTP server
     server = ThreadingHTTPServer(('0.0.0.0', port), V3Handler)

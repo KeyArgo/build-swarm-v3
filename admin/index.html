@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Build Swarm v3 — Admin</title>
+  <link rel="stylesheet" href="/uplot.min.css">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+</head>
+<body>
+<script src="/uplot.min.js"></script>
+
+<!-- Login Overlay -->
+<div class="login-overlay">
+  <div class="login-card">
+    <h2>Build Swarm Admin</h2>
+    <p>Enter the admin key to continue</p>
+    <input type="password" id="login-key" placeholder="Admin key" autocomplete="off" spellcheck="false">
+    <button class="login-btn" id="login-btn">Authenticate</button>
+    <div class="login-error" id="login-error"></div>
+  </div>
+</div>
+
+<!-- Dashboard -->
+<div class="dashboard" style="display:none">
+
+  <!-- Offline Banner -->
+  <div class="offline-banner">Control plane unreachable</div>
+
+  <!-- Header -->
+  <header class="header">
+    <div class="header-left">
+      <span class="header-title">Build Swarm Admin</span>
+      <span class="header-version">v3.1.0</span>
+    </div>
+    <div class="header-right">
+      <span class="connection-dot" title="Connection status"></span>
+    </div>
+  </header>
+
+  <!-- Tabs -->
+  <nav class="tabs" role="tablist">
+    <button class="tab active" data-tab="overview" role="tab">Overview</button>
+    <button class="tab" data-tab="fleet" role="tab">Fleet</button>
+    <button class="tab" data-tab="drone-mgmt" role="tab">Drone Mgmt</button>
+    <button class="tab" data-tab="binhost" role="tab">Binhost</button>
+    <button class="tab" data-tab="queue" role="tab">Queue</button>
+    <button class="tab" data-tab="history" role="tab">History</button>
+    <button class="tab" data-tab="topology" role="tab">Topology</button>
+    <button class="tab" data-tab="wire" role="tab">Wire</button>
+    <button class="tab" data-tab="data" role="tab">Data</button>
+    <button class="tab" data-tab="events" role="tab">Events</button>
+  </nav>
+
+  <!-- ═══════════════════ OVERVIEW TAB ═══════════════════ -->
+  <div class="tab-content active" id="tab-overview" role="tabpanel">
+
+    <!-- Stat Cards — Row 1: Live Counters -->
+    <div class="cards-row">
+      <div class="stat-card" id="stat-drones-online">
+        <div class="label">Drones Online</div>
+        <div class="value cyan">-</div>
+      </div>
+      <div class="stat-card" id="stat-total-cores">
+        <div class="label">Total Cores</div>
+        <div class="value purple">-</div>
+      </div>
+      <div class="stat-card" id="stat-queue-depth">
+        <div class="label">Queue Depth</div>
+        <div class="value cyan">-</div>
+      </div>
+      <div class="stat-card" id="stat-received">
+        <div class="label">Received</div>
+        <div class="value green">-</div>
+      </div>
+      <div class="stat-card" id="stat-blocked">
+        <div class="label">Blocked</div>
+        <div class="value green">-</div>
+      </div>
+    </div>
+
+    <!-- Stat Cards — Row 2: Build Stats -->
+    <div class="cards-row">
+      <div class="stat-card" id="stat-success-rate">
+        <div class="label">Success Rate</div>
+        <div class="value green">-</div>
+      </div>
+      <div class="stat-card" id="stat-avg-build">
+        <div class="label">Avg Build Time</div>
+        <div class="value">-</div>
+      </div>
+      <div class="stat-card" id="stat-total-builds">
+        <div class="label">Total Builds</div>
+        <div class="value">-</div>
+      </div>
+      <div class="stat-card" id="stat-total-failed">
+        <div class="label">Failed</div>
+        <div class="value red">-</div>
+      </div>
+      <div class="stat-card" id="stat-total-duration">
+        <div class="label">Total Duration</div>
+        <div class="value">-</div>
+      </div>
+    </div>
+
+    <!-- Build Progress -->
+    <div class="section-card">
+      <h3>Build Progress</h3>
+      <div class="progress-bar">
+        <div class="segment received" style="width:0%"></div>
+        <div class="segment delegated" style="width:0%"></div>
+        <div class="segment needed" style="width:0%"></div>
+        <div class="segment blocked" style="width:0%"></div>
+      </div>
+      <div class="progress-legend">
+        <span><span style="color:var(--green)">&#9632;</span> Received <span id="progress-received-n"></span></span>
+        <span><span style="color:var(--cyan)">&#9632;</span> Delegated <span id="progress-delegated-n"></span></span>
+        <span><span style="color:var(--text-muted)">&#9632;</span> Needed <span id="progress-needed-n"></span></span>
+        <span><span style="color:var(--red)">&#9632;</span> Blocked <span id="progress-blocked-n"></span></span>
+      </div>
+    </div>
+
+    <!-- Charts -->
+    <div class="charts-grid">
+      <div class="section-card">
+        <h3>Queue Depth</h3>
+        <div id="chart-queue" class="chart-container"></div>
+      </div>
+      <div class="section-card">
+        <h3>Build Rate</h3>
+        <div id="chart-buildrate" class="chart-container"></div>
+      </div>
+    </div>
+
+    <!-- Session Info -->
+    <div class="section-card">
+      <h3>Active Session</h3>
+      <div class="session-grid">
+        <div><span class="session-label">Session</span> <span id="session-name">-</span></div>
+        <div><span class="session-label">Progress</span> <span id="session-progress">-</span></div>
+        <div><span class="session-label">Elapsed</span> <span id="session-elapsed">-</span></div>
+        <div><span class="session-label">State</span> <span id="session-state">-</span></div>
+      </div>
+    </div>
+
+    <!-- Control Panel -->
+    <div class="section-card">
+      <h3>Control Panel</h3>
+
+      <!-- Build Flow -->
+      <div class="control-group">
+        <span class="control-group-label">Build Flow</span>
+        <div class="control-panel">
+          <button class="btn" data-action="pause" title="Stop delegating new packages to drones">Pause Queue</button>
+          <button class="btn success" data-action="resume" title="Resume delegating packages">Resume Queue</button>
+          <button class="btn" data-action="rebalance" title="Reclaim all delegated packages back to needed">Rebalance</button>
+        </div>
+      </div>
+
+      <!-- Error Recovery -->
+      <div class="control-group">
+        <span class="control-group-label">Error Recovery</span>
+        <div class="control-panel">
+          <button class="btn" data-action="unblock" title="Move all blocked packages back to needed">Unblock All</button>
+          <button class="btn" data-action="retry_failures" title="Re-queue all failed packages for retry">Retry All Failures</button>
+          <button class="btn" data-action="clear_failures" title="Reset failure counts and unblock everything">Clear All Failures</button>
+          <button class="btn" data-action="unground" title="Reset all circuit breakers, unground all drones">Unground All Drones</button>
+        </div>
+      </div>
+
+      <!-- Dangerous -->
+      <div class="control-group">
+        <span class="control-group-label">Destructive</span>
+        <div class="control-panel">
+          <button class="btn danger" data-action="reset" data-confirm="Reset the ENTIRE build queue? All progress will be lost.">Reset Queue</button>
+        </div>
+      </div>
+
+      <div id="ctrl-result" class="ctrl-result"></div>
+    </div>
+
+    <!-- System Info -->
+    <div class="section-card">
+      <h3>System Info</h3>
+      <div id="system-info-content" class="mono" style="font-size:0.8rem">
+        <div class="empty-state"><div class="spinner"></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════ FLEET TAB ═══════════════════ -->
+  <div class="tab-content" id="tab-fleet" role="tabpanel">
+
+    <!-- Fleet Summary Cards -->
+    <div class="cards-row" id="fleet-summary-cards">
+      <div class="stat-card" id="stat-fleet-total">
+        <div class="label">Total Fleet</div>
+        <div class="value cyan">-</div>
+      </div>
+      <div class="stat-card" id="stat-fleet-online">
+        <div class="label">Online</div>
+        <div class="value green">-</div>
+      </div>
+      <div class="stat-card" id="stat-fleet-v3-count">
+        <div class="label">V3 Drones</div>
+        <div class="value cyan">-</div>
+      </div>
+      <div class="stat-card" id="stat-fleet-v2-count">
+        <div class="label">V2 Drones</div>
+        <div class="value amber">-</div>
+      </div>
+      <div class="stat-card" id="stat-fleet-grounded">
+        <div class="label">Grounded</div>
+        <div class="value red">-</div>
+      </div>
+    </div>
+
+    <!-- V3 Drones -->
+    <div class="section-card">
+      <h3>V3 Drones</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>IP</th>
+              <th>Status</th>
+              <th>Health</th>
+              <th>Cores</th>
+              <th>CPU</th>
+              <th>RAM</th>
+              <th>Load</th>
+              <th>Current Task</th>
+              <th>Builds</th>
+              <th>Version</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="fleet-v3-tbody">
+            <tr><td colspan="12" class="empty-state">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- V2 Drones -->
+    <div class="section-card">
+      <h3>V2 Drones <span class="badge v2" style="vertical-align:middle">LEGACY</span></h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>IP</th>
+              <th>Status</th>
+              <th>Type</th>
+              <th>CPU</th>
+              <th>RAM</th>
+              <th>Load</th>
+              <th>Current Task</th>
+              <th>Version</th>
+            </tr>
+          </thead>
+          <tbody id="fleet-v2-tbody">
+            <tr><td colspan="9" class="empty-state">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════ DRONE MGMT TAB ═══════════════════ -->
+  <div class="tab-content" id="tab-drone-mgmt" role="tabpanel">
+
+    <!-- Drone Config List -->
+    <div class="section-card">
+      <h3>Drone Configurations</h3>
+      <p style="color:var(--text-dim);font-size:0.8rem;margin-bottom:1rem">
+        Per-drone SSH credentials, resource limits, and build settings.
+        Select a drone to edit or add a new configuration.
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Drone</th>
+              <th>SSH User</th>
+              <th>Port</th>
+              <th>Auth</th>
+              <th>Cores</th>
+              <th>Jobs</th>
+              <th>Control Plane</th>
+              <th>Locked</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="drone-config-tbody">
+            <tr><td colspan="9" class="empty-state">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Drone Config Editor -->
+    <div class="section-card" id="drone-config-editor" style="display:none">
+      <h3 id="drone-editor-title">Edit Drone Config</h3>
+      <form id="drone-config-form" autocomplete="off">
+        <input type="hidden" id="dc-node-name">
+
+        <div class="form-grid">
+          <!-- SSH Section -->
+          <div class="form-section">
+            <h4>SSH Connection</h4>
+            <div class="form-row">
+              <label for="dc-ssh-user">User</label>
+              <input type="text" id="dc-ssh-user" placeholder="root">
+            </div>
+            <div class="form-row">
+              <label for="dc-ssh-port">Port</label>
+              <input type="number" id="dc-ssh-port" placeholder="22" min="1" max="65535">
+            </div>
+            <div class="form-row">
+              <label for="dc-ssh-key">Key Path</label>
+              <input type="text" id="dc-ssh-key" placeholder="/root/.ssh/id_ed25519">
+            </div>
+            <div class="form-row">
+              <label for="dc-ssh-pass">Password</label>
+              <input type="password" id="dc-ssh-pass" placeholder="(key-based auth preferred)">
+            </div>
+          </div>
+
+          <!-- Resources Section -->
+          <div class="form-section">
+            <h4>Resources</h4>
+            <div class="form-row">
+              <label for="dc-cores">Cores Limit</label>
+              <input type="number" id="dc-cores" placeholder="all" min="1" max="256">
+            </div>
+            <div class="form-row">
+              <label for="dc-jobs">Emerge Jobs</label>
+              <input type="number" id="dc-jobs" placeholder="2" min="1" max="64">
+            </div>
+            <div class="form-row">
+              <label for="dc-ram">RAM Limit (GB)</label>
+              <input type="number" id="dc-ram" placeholder="no limit" min="1" step="0.5">
+            </div>
+          </div>
+
+          <!-- Behavior Section -->
+          <div class="form-section">
+            <h4>Behavior</h4>
+            <div class="form-row">
+              <label for="dc-auto-reboot">Auto Reboot</label>
+              <select id="dc-auto-reboot">
+                <option value="1">Yes</option>
+                <option value="0">No</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <label for="dc-protected">Protected</label>
+              <select id="dc-protected">
+                <option value="0">No</option>
+                <option value="1">Yes — prevent accidental reboot/deletion</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <label for="dc-max-failures">Max Failures</label>
+              <input type="number" id="dc-max-failures" placeholder="use global" min="1" max="100">
+            </div>
+            <div class="form-row">
+              <label for="dc-locked">Bloat Lock</label>
+              <select id="dc-locked">
+                <option value="1">Locked — package.mask + chattr active</option>
+                <option value="0">Unlocked — allow package installs</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- Identity Section -->
+          <div class="form-section">
+            <h4>Identity</h4>
+            <div class="form-row">
+              <label for="dc-display-name">Display Name</label>
+              <input type="text" id="dc-display-name" placeholder="(use node name)">
+            </div>
+            <div class="form-row">
+              <label for="dc-v2-name">V2 Name</label>
+              <input type="text" id="dc-v2-name" placeholder="e.g. drone-Izar">
+            </div>
+            <div class="form-row">
+              <label for="dc-control-plane">Control Plane</label>
+              <select id="dc-control-plane">
+                <option value="v3">v3</option>
+                <option value="v2">v2</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <label for="dc-binhost-url">Binhost Upload URL</label>
+              <input type="text" id="dc-binhost-url" placeholder="(use default)">
+            </div>
+          </div>
+        </div>
+
+        <!-- Notes -->
+        <div class="form-row" style="margin-top:1rem">
+          <label for="dc-notes">Notes</label>
+          <textarea id="dc-notes" rows="3" placeholder="Admin notes about this drone..."></textarea>
+        </div>
+
+        <!-- Buttons -->
+        <div class="form-actions">
+          <button type="submit" class="btn success">Save Config</button>
+          <button type="button" class="btn" onclick="closeDroneEditor()">Cancel</button>
+          <button type="button" class="btn danger" id="dc-delete-btn" style="margin-left:auto">Delete Config</button>
+        </div>
+        <div id="dc-save-status" style="margin-top:0.5rem;font-size:0.8rem"></div>
+      </form>
+    </div>
+
+    <!-- Add New Drone Config -->
+    <div class="section-card">
+      <h3>Add Drone Config</h3>
+      <div style="display:flex;gap:0.75rem;align-items:center">
+        <input type="text" id="new-drone-name" placeholder="drone name (e.g. drone-io)" style="flex:1;padding:0.5rem;background:var(--surface);border:1px solid var(--border);color:var(--text);border-radius:4px">
+        <button class="btn success" onclick="addNewDroneConfig()">Add</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════ BINHOST TAB ═══════════════════ -->
+  <div class="tab-content" id="tab-binhost" role="tabpanel">
+    <div class="cards-row">
+      <div class="stat-card" id="stat-binhost-primary-status">
+        <div class="label">Primary (proxmox-io)</div>
+        <div class="value green">-</div>
+      </div>
+      <div class="stat-card" id="stat-binhost-secondary-status">
+        <div class="label">Secondary (proxmox-titan)</div>
+        <div class="value">-</div>
+      </div>
+      <div class="stat-card" id="stat-binhost-active">
+        <div class="label">Active Binhost</div>
+        <div class="value cyan">-</div>
+      </div>
+    </div>
+    <div class="section-card">
+      <h3>Binhost Controls</h3>
+      <p style="color:var(--text-dim);font-size:0.8rem;margin-bottom:1rem">
+        Primary: <span class="mono" id="binhost-primary-ip">-</span> (seasonal: fall/winter/spring) &mdash;
+        Secondary: <span class="mono" id="binhost-secondary-ip">-</span> (always available)
+      </p>
+      <div class="control-panel">
+        <button class="btn" onclick="binhostAction('flip')">Flip Active Binhost</button>
+        <button class="btn" onclick="binhostAction('rsync')">Sync Primary &rarr; Secondary</button>
+      </div>
+      <div id="binhost-result" class="ctrl-result"></div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════ QUEUE TAB ═══════════════════ -->
+  <div class="tab-content" id="tab-queue" role="tabpanel">
+
+    <!-- Queue Stats -->
+    <div class="cards-row">
+      <div class="stat-card" id="stat-q-needed"><div class="label">Needed</div><div class="value cyan">-</div></div>
+      <div class="stat-card" id="stat-q-delegated"><div class="label">Delegated</div><div class="value purple">-</div></div>
+      <div class="stat-card" id="stat-q-received"><div class="label">Received</div><div class="value green">-</div></div>
+      <div class="stat-card" id="stat-q-blocked"><div class="label">Blocked</div><div class="value red">-</div></div>
+      <div class="stat-card" id="stat-q-total"><div class="label">Total</div><div class="value">-</div></div>
+    </div>
+
+    <!-- Queue Controls -->
+    <div class="section-card">
+      <h3>Queue Controls</h3>
+      <div class="control-panel">
+        <button class="btn" data-action="unblock" title="Move all blocked back to needed">Unblock All</button>
+        <button class="btn" data-action="retry_failures" title="Re-queue all failed">Retry Failures</button>
+        <button class="btn" data-action="clear_failures" title="Reset failure counts">Clear Failures</button>
+        <button class="btn" data-action="rebalance" title="Reclaim delegated back to needed">Rebalance</button>
+        <button class="btn danger" data-action="reset" data-confirm="Reset the entire queue?">Reset Queue</button>
+      </div>
+      <div id="queue-ctrl-result" class="ctrl-result"></div>
+    </div>
+
+    <!-- Package Table -->
+    <div class="section-card">
+      <h3>Packages
+        <span style="float:right;font-size:0.8rem;font-weight:400">
+          <select id="queue-filter" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:0.25rem 0.5rem;font-size:0.78rem">
+            <option value="">All</option>
+            <option value="needed">Needed</option>
+            <option value="delegated">Delegated</option>
+            <option value="received">Received</option>
+            <option value="blocked">Blocked</option>
+            <option value="failed">Failed</option>
+          </select>
+        </span>
+      </h3>
+      <div class="table-wrap" style="max-height:500px;overflow-y:auto">
+        <table>
+          <thead>
+            <tr>
+              <th>Package</th>
+              <th>Status</th>
+              <th>Assigned To</th>
+              <th>Failures</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="queue-tbody">
+            <tr><td colspan="4" class="empty-state">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════ HISTORY TAB ═══════════════════ -->
+  <div class="tab-content" id="tab-history" role="tabpanel">
+    <!-- History Stats -->
+    <div class="cards-row">
+      <div class="stat-card" id="stat-hist-total"><div class="label">Total Builds</div><div class="value">-</div></div>
+      <div class="stat-card" id="stat-hist-success"><div class="label">Successful</div><div class="value green">-</div></div>
+      <div class="stat-card" id="stat-hist-failed"><div class="label">Failed</div><div class="value red">-</div></div>
+      <div class="stat-card" id="stat-hist-rate"><div class="label">Success Rate</div><div class="value green">-</div></div>
+      <div class="stat-card" id="stat-hist-avg"><div class="label">Avg Duration</div><div class="value">-</div></div>
+    </div>
+    <div class="section-card">
+      <h3>Build History
+        <span style="float:right;font-size:0.8rem;font-weight:400">
+          <select id="history-status-filter" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:0.25rem 0.5rem;font-size:0.78rem">
+            <option value="">All Statuses</option>
+            <option value="success">Success</option>
+            <option value="failed">Failed</option>
+            <option value="upload_failed">Upload Failed</option>
+          </select>
+          <select id="history-drone-filter" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:0.25rem 0.5rem;font-size:0.78rem;margin-left:0.25rem">
+            <option value="">All Drones</option>
+          </select>
+        </span>
+      </h3>
+      <div class="table-wrap" style="max-height:500px;overflow-y:auto">
+        <table>
+          <thead>
+            <tr>
+              <th>Package</th>
+              <th>Drone</th>
+              <th>Status</th>
+              <th>Duration</th>
+              <th>Error</th>
+              <th>Time</th>
+            </tr>
+          </thead>
+          <tbody id="history-tbody">
+            <tr><td colspan="6" class="empty-state">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════ TOPOLOGY TAB ═══════════════════ -->
+  <div class="tab-content" id="tab-topology" role="tabpanel">
+    <div class="section-card">
+      <h3>Network Topology</h3>
+      <div id="topology-svg" style="display:flex;justify-content:center;padding:2rem">
+        <div class="empty-state"><div class="spinner"></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════ WIRE TAB ═══════════════════ -->
+  <div class="tab-content" id="tab-wire" role="tabpanel">
+    <div class="section-card">
+      <h3>Protocol Inspector
+        <span style="float:right;font-size:0.8rem;font-weight:400">
+          <select id="wire-filter" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:0.25rem 0.5rem;font-size:0.78rem">
+            <option value="">All Types</option>
+            <option value="heartbeat">heartbeat</option>
+            <option value="work_request">work_request</option>
+            <option value="delegation">delegation</option>
+            <option value="completion">completion</option>
+            <option value="status_query">status_query</option>
+          </select>
+        </span>
+      </h3>
+      <div class="table-wrap" style="max-height:500px;overflow-y:auto">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Source</th>
+              <th>Method</th>
+              <th>Path</th>
+              <th>Type</th>
+              <th>Status</th>
+              <th>Latency</th>
+              <th>Drone</th>
+              <th>Package</th>
+            </tr>
+          </thead>
+          <tbody id="wire-tbody">
+            <tr><td colspan="9" class="empty-state">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════ DATA TAB ═══════════════════ -->
+  <div class="tab-content" id="tab-data" role="tabpanel">
+    <div class="section-card">
+      <h3>SQL Explorer</h3>
+      <div style="display:flex;gap:0.75rem;margin-bottom:1rem">
+        <input type="text" id="sql-query" placeholder="SELECT * FROM nodes LIMIT 20" style="flex:1;padding:0.5rem;background:var(--bg-input);border:1px solid var(--border);color:var(--text);border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:0.8rem">
+        <button class="btn success" onclick="runSQL()">Run</button>
+      </div>
+      <div id="sql-tables" style="margin-bottom:1rem;font-size:0.78rem;color:var(--text-dim)"></div>
+      <div class="table-wrap" style="max-height:500px;overflow-y:auto">
+        <table>
+          <thead id="sql-thead"><tr></tr></thead>
+          <tbody id="sql-tbody">
+            <tr><td class="empty-state">Run a query above (SELECT only)</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════ EVENTS TAB ═══════════════════ -->
+  <div class="tab-content" id="tab-events" role="tabpanel">
+    <div class="section-card">
+      <h3>Activity Feed
+        <span style="float:right;font-size:0.8rem;font-weight:400">
+          <select id="events-filter" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:0.25rem 0.5rem;font-size:0.78rem">
+            <option value="">All Events</option>
+            <option value="complete">complete</option>
+            <option value="fail">fail</option>
+            <option value="grounded">grounded</option>
+            <option value="control">control</option>
+            <option value="register">register</option>
+          </select>
+        </span>
+      </h3>
+      <div id="events-feed" class="activity-feed">
+        <div class="empty-state">Loading events...</div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /dashboard -->
+
+<script src="/app.js"></script>
+</body>
+</html>

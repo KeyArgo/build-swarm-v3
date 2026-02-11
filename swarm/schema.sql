@@ -106,6 +106,59 @@ CREATE INDEX IF NOT EXISTS idx_metrics_node ON metrics_log(node_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status);
 CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);
 
+-- Drone admin config: persistent per-drone settings managed from the admin dashboard.
+-- Separate from `nodes` (which is self-reported via heartbeat). This is what the
+-- admin WANTS, not what the drone reports.
+CREATE TABLE IF NOT EXISTS drone_config (
+    node_name TEXT PRIMARY KEY,               -- matches nodes.name (e.g. "drone-io")
+
+    -- SSH access
+    ssh_user TEXT DEFAULT 'root',
+    ssh_port INTEGER DEFAULT 22,
+    ssh_key_path TEXT,                        -- e.g. /root/.ssh/id_ed25519 (control plane side)
+    ssh_password TEXT,                        -- optional fallback (stored in plaintext — LAN only)
+
+    -- Resource limits (what the drone should use, not what it has)
+    cores_limit INTEGER,                      -- MAKEOPTS -j value (NULL = use all)
+    emerge_jobs INTEGER DEFAULT 2,            -- EMERGE_DEFAULT_OPTS --jobs=N
+    ram_limit_gb REAL,                        -- soft limit for awareness (NULL = no limit)
+
+    -- Build behavior
+    auto_reboot INTEGER DEFAULT 1,            -- allow health monitor to reboot this drone
+    protected INTEGER DEFAULT 0,              -- prevent accidental deletion/reboot
+    max_failures INTEGER,                     -- per-drone circuit breaker threshold (NULL = use global)
+    binhost_upload_url TEXT,                  -- where to send built packages (NULL = default)
+
+    -- Identity
+    display_name TEXT,                        -- human-friendly name (NULL = use node_name)
+    v2_name TEXT,                             -- legacy v2 name mapping (e.g. "drone-Izar")
+    control_plane TEXT DEFAULT 'v3'           -- which CP this drone should talk to: v2 | v3
+        CHECK(control_plane IN ('v2','v3')),
+
+    -- Bloat protection
+    locked INTEGER DEFAULT 1,                 -- should this drone be locked (package.mask + chattr)
+
+    -- Notes
+    notes TEXT,                               -- free text for admin notes
+
+    -- Metadata
+    updated_at REAL DEFAULT (strftime('%s','now')),
+    created_at REAL DEFAULT (strftime('%s','now'))
+);
+
+-- Events: persistent activity feed (v3.1)
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL NOT NULL,
+    event_type TEXT NOT NULL,
+    message TEXT,
+    details_json TEXT,
+    drone_id TEXT,
+    package TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
+CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
+
 -- Protocol log: every HTTP request/response pair (Wireshark-style capture)
 CREATE TABLE IF NOT EXISTS protocol_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

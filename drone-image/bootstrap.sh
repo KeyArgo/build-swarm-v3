@@ -474,12 +474,84 @@ CRONEOF
     mkdir -p /etc/cron.d
     echo "0 6 * * * root /opt/build-swarm/comply-cron.sh" > /etc/cron.d/swarm-comply
     ok "Compliance tools installed (daily check at 06:00)"
+
+    # Install drone-lock / drone-unlock scripts
+    SCRIPT_DIR="$(dirname "$0")"
+    for script in drone-lock.sh drone-unlock.sh; do
+        if [ -f "${SCRIPT_DIR}/${script}" ]; then
+            cp "${SCRIPT_DIR}/${script}" "/opt/build-swarm/${script}"
+            chmod +x "/opt/build-swarm/${script}"
+        fi
+    done
+    # Create symlinks in /usr/local/sbin for convenience
+    ln -sf /opt/build-swarm/drone-lock.sh /usr/local/sbin/drone-lock
+    ln -sf /opt/build-swarm/drone-unlock.sh /usr/local/sbin/drone-unlock
+    ok "drone-lock / drone-unlock installed to PATH"
 else
     info "[DRY RUN] Would install compliance tools and daily cron job"
 fi
 
+# ── 9b. Bloat Protection Lockdown ──
+step "9b/11 Installing bloat protection"
+
+if [ "$DRY_RUN" = true ]; then
+    info "[DRY RUN] Would generate package.mask and set immutable flags"
+else
+    # Generate package.mask from drone.spec forbidden_patterns
+    SPEC_FOR_MASK="/etc/build-swarm/drone.spec"
+    MASK_TARGET="/etc/portage/package.mask/drone-lockdown"
+
+    if [ -f "$SPEC_FOR_MASK" ]; then
+        mkdir -p /etc/portage/package.mask
+        python3 -c "
+import json
+with open('$SPEC_FOR_MASK') as f:
+    spec = json.load(f)
+patterns = spec.get('forbidden_patterns', [])
+print('# Build Swarm v3 — Drone Lockdown')
+print('# Auto-generated from drone.spec by bootstrap.sh')
+print('# To temporarily allow installs: drone-unlock')
+print('# To regenerate: drone-lock')
+print(f'# Generated: $(date -Iseconds)')
+print(f'# Patterns: {len(patterns)}')
+print()
+for p in patterns:
+    print(p)
+" > "$MASK_TARGET"
+        MASK_COUNT=$(grep -c '^[^#]' "$MASK_TARGET" 2>/dev/null || echo 0)
+        ok "package.mask installed ($MASK_COUNT forbidden patterns)"
+
+        # Set immutable flags on critical files
+        LOCKDOWN_FILES=(
+            "/var/lib/portage/world"
+            "/etc/portage/make.conf"
+            "$MASK_TARGET"
+            "/etc/portage/package.use/swarm-drone"
+            "/etc/portage/package.accept_keywords/swarm-drone"
+        )
+
+        LOCKED=0
+        for f in "${LOCKDOWN_FILES[@]}"; do
+            if [ -f "$f" ]; then
+                chattr -i "$f" 2>/dev/null || true
+                chattr +i "$f" 2>/dev/null
+                if lsattr "$f" 2>/dev/null | grep -q '^....i'; then
+                    ((LOCKED++))
+                fi
+            fi
+        done
+        ok "Immutable flags set on $LOCKED critical files"
+
+        # Record lock state
+        echo "locked $(date -Iseconds) by bootstrap.sh ($LOCKED files)" > /etc/build-swarm/.lock-state
+        ok "Drone is LOCKED — use 'drone-unlock' to temporarily allow changes"
+    else
+        warn "drone.spec not found, skipping lockdown"
+    fi
+fi
+
 # ── 10. SSH key and OpenRC service ──
-step "10/10 Setting up SSH and service"
+step "10/11 Setting up SSH and OpenRC service"
 
 # SSH key
 if [ ! -f /root/.ssh/id_ed25519 ] && [ ! -f /root/.ssh/id_rsa ]; then
@@ -554,6 +626,15 @@ echo -e "  ${DIM}Config:${RESET}   /etc/build-swarm/drone.conf"
 echo -e "  ${DIM}Logs:${RESET}     /var/log/build-swarm/drone.log"
 PKG_FINAL=$(ls -d /var/db/pkg/*/* 2>/dev/null | wc -l)
 echo -e "  ${DIM}Packages:${RESET} $PKG_FINAL installed"
+if [ -f /etc/build-swarm/.lock-state ]; then
+    echo -e "  ${DIM}Lock:${RESET}     ${GREEN}LOCKED${RESET} (drone-unlock to modify)"
+fi
 echo ""
 echo -e "  ${DIM}The drone should register within ~30 seconds.${RESET}"
 echo -e "  ${DIM}Check: build-swarmv3 fleet${RESET}"
+echo ""
+echo -e "  ${BOLD}Bloat protection:${RESET}"
+echo -e "    ${CYAN}drone-lock --status${RESET}   Check lock state"
+echo -e "    ${CYAN}drone-unlock${RESET}          Temporarily allow changes"
+echo -e "    ${CYAN}drone-unlock -t 30${RESET}    Unlock for 30 minutes"
+echo -e "    ${CYAN}drone-lock${RESET}            Relock after changes"
