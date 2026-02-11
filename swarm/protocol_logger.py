@@ -90,6 +90,20 @@ def _truncate(text: Optional[str], max_len: int) -> Optional[str]:
     return text[:max_len]
 
 
+def _resolve_name(drone_id: Optional[str]) -> str:
+    """Resolve a raw drone ID to its human-readable name."""
+    if not drone_id:
+        return 'unknown'
+    if _db:
+        try:
+            name = _db.get_drone_name(drone_id)
+            if name and name != drone_id[:12]:
+                return name
+        except Exception:
+            pass
+    return drone_id[:12]
+
+
 def _extract_fields(msg_type: str, method: str, path: str,
                     req_body: Optional[str], resp_body: Optional[str],
                     status_code: int, source_ip: str) -> dict:
@@ -118,7 +132,9 @@ def _extract_fields(msg_type: str, method: str, path: str,
         else:
             fields['response_summary'] = f'{status_code} no_work'
         if fields['drone_id']:
-            fields['request_summary'] = f'GET /work drone={fields["drone_id"]}'
+            drone_label = _resolve_name(fields['drone_id'])
+            fields['source_node'] = drone_label
+            fields['request_summary'] = f'GET /work drone={drone_label}'
 
     elif msg_type == 'register':
         fields['drone_id'] = req.get('id')
@@ -132,6 +148,7 @@ def _extract_fields(msg_type: str, method: str, path: str,
     elif msg_type == 'complete':
         fields['drone_id'] = req.get('id')
         fields['package'] = req.get('package')
+        fields['source_node'] = _resolve_name(fields['drone_id'])
         status = req.get('status', '?')
         dur = req.get('build_duration_s')
         dur_str = f' {dur:.1f}s' if dur else ''
@@ -172,7 +189,9 @@ def _extract_fields(msg_type: str, method: str, path: str,
         parts = path.split('/')
         if len(parts) >= 5:
             fields['drone_id'] = parts[4]
-        fields['request_summary'] = f'{method} {msg_type} node={fields["drone_id"]}'
+        node_label = _resolve_name(fields['drone_id']) if fields['drone_id'] else '?'
+        fields['source_node'] = node_label
+        fields['request_summary'] = f'{method} {msg_type} node={node_label}'
 
     return fields
 
@@ -319,14 +338,26 @@ def get_protocol_entries(db, since_id: int = 0, msg_type: str = None,
         LIMIT ?
     """, tuple(params))
 
-    return [dict(r) for r in rows]
+    results = []
+    for r in rows:
+        d = dict(r)
+        # Resolve raw drone_id to name for display
+        if d.get('drone_id') and not d.get('source_node'):
+            d['source_node'] = db.get_drone_name(d['drone_id'])
+        results.append(d)
+    return results
 
 
 def get_protocol_detail(db, entry_id: int) -> Optional[dict]:
     """Fetch full protocol entry including request/response bodies."""
     row = db.fetchone(
         "SELECT * FROM protocol_log WHERE id = ?", (entry_id,))
-    return dict(row) if row else None
+    if not row:
+        return None
+    d = dict(row)
+    if d.get('drone_id') and not d.get('source_node'):
+        d['source_node'] = db.get_drone_name(d['drone_id'])
+    return d
 
 
 def get_protocol_stats(db, since: float = None) -> dict:

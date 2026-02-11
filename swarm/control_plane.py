@@ -237,12 +237,13 @@ class V3Handler(BaseHTTPRequestHandler):
             session = db.get_active_session()
             drones = db.get_all_nodes(include_offline=True)
 
-            # Build drone status map
+            # Build drone status map (keyed by name, not raw ID)
             drone_status = {}
             drone_health_map = {}
             for d in drones:
-                drone_status[d['id']] = {
-                    'name': d['name'],
+                dname = d['name'] or d['id'][:12]
+                drone_status[dname] = {
+                    'name': dname,
                     'ip': d['ip'],
                     'status': d['status'],
                     'current_task': d.get('current_task'),
@@ -252,14 +253,14 @@ class V3Handler(BaseHTTPRequestHandler):
                 }
                 h = db.get_drone_health(d['id'])
                 if h['failures'] > 0:
-                    drone_health_map[d['id']] = h
+                    drone_health_map[dname] = h
 
             # Build package lists for compatibility
             needed_pkgs = [p['package'] for p in db.get_needed_packages(limit=10)]
             delegated_pkgs = {}
             for p in db.get_delegated_packages():
                 delegated_pkgs[p['package']] = {
-                    'drone': p['assigned_to'],
+                    'drone': db.get_drone_name(p['assigned_to']),
                     'assigned_at': p.get('assigned_at')
                 }
             blocked_pkgs = [p['package'] for p in db.get_blocked_packages()]
@@ -433,7 +434,8 @@ class V3Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 result.append({
-                    'drone_id': d['id'],
+                    'drone': d['name'] or d['id'][:12],
+                    'drone_id': d['id'],  # kept for internal use
                     'name': d['name'],
                     'ip': d['ip'],
                     'status': d['status'],
@@ -828,6 +830,9 @@ class V3Handler(BaseHTTPRequestHandler):
 
         elif action == 'unground':
             drone_id = data.get('drone_id')
+            # Also accept drone name and resolve to ID
+            if not drone_id and data.get('drone'):
+                drone_id = db.resolve_drone_id(data['drone'])
             if drone_id:
                 health_monitor.unground_drone(drone_id)
             else:

@@ -209,6 +209,10 @@ class SwarmDB:
         name = self.fetchval("SELECT name FROM nodes WHERE id = ?", (drone_id,))
         return name or drone_id[:12]
 
+    def resolve_drone_id(self, name: str) -> Optional[str]:
+        """Resolve a drone name to its ID. Returns None if not found."""
+        return self.fetchval("SELECT id FROM nodes WHERE name = ?", (name,))
+
     def _row_to_node(self, row: sqlite3.Row) -> dict:
         """Convert a database row to a node dict."""
         d = dict(row)
