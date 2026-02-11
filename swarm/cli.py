@@ -271,10 +271,10 @@ def cmd_fresh(args):
     try:
         result = subprocess.run(
             ['emerge', '--pretend', '--emptytree', '@world'],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             timeout=300,
-            stderr=subprocess.DEVNULL,
         )
     except FileNotFoundError:
         print(f'{C.RED}Error:{C.RESET} emerge command not found. '
