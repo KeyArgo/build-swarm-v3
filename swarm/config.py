@@ -66,7 +66,7 @@ RELEASES_BASE_PATH = os.environ.get('RELEASES_BASE_PATH', '/var/cache/binpkgs-re
 BINHOST_SYMLINK_PATH = os.environ.get('BINHOST_SYMLINK_PATH', '/var/cache/binpkgs')
 
 # Binhost configuration (primary = seasonal, secondary = always-on)
-BINHOST_PRIMARY_IP = os.environ.get('BINHOST_PRIMARY_IP', '10.0.0.199')
+BINHOST_PRIMARY_IP = os.environ.get('BINHOST_PRIMARY_IP', '10.0.0.204')
 BINHOST_SECONDARY_IP = os.environ.get('BINHOST_SECONDARY_IP', '100.114.16.118')
 BINHOST_PRIMARY_PATH = os.environ.get('BINHOST_PRIMARY_PATH', '/var/cache/binpkgs')
 BINHOST_SECONDARY_PATH = os.environ.get('BINHOST_SECONDARY_PATH', '/var/cache/binpkgs')
@@ -74,10 +74,10 @@ BINHOST_PRIMARY_PORT = int(os.environ.get('BINHOST_PRIMARY_PORT', 80))
 BINHOST_SECONDARY_PORT = int(os.environ.get('BINHOST_SECONDARY_PORT', 80))
 
 # V2 gateway proxy
-V2_GATEWAY_URL = os.environ.get('V2_GATEWAY_URL', 'http://10.0.0.199:8090')
+V2_GATEWAY_URL = os.environ.get('V2_GATEWAY_URL', 'http://localhost:8100')
 
 # Control plane URL — auto-discover if not set
-KNOWN_HOSTS = ['localhost', '10.0.0.199']
+KNOWN_HOSTS = ['localhost', '100.91.215.26']
 
 def discover_control_plane(port=None):
     """Find a running control plane. Checks localhost first, then known hosts."""

@@ -501,14 +501,30 @@ class V3Handler(BaseHTTPRequestHandler):
             global _binhost_cache
             now = time.time()
             if now - _binhost_cache.get('ts', 0) > 60:
-                import glob as _glob
-                staging = cfg.BINHOST_PRIMARY_PATH or '/var/cache/binpkgs'
-                pkgs = _glob.glob(os.path.join(staging, '**/*.gpkg.tar'), recursive=True)
-                total_size = sum(os.path.getsize(p) for p in pkgs if os.path.exists(p))
-                _binhost_cache = {
-                    'ts': now,
-                    'data': {'packages': len(pkgs), 'size_mb': round(total_size / 1048576)}
-                }
+                binhost_ip = cfg.BINHOST_PRIMARY_IP
+                binhost_path = cfg.BINHOST_PRIMARY_PATH or '/var/cache/binpkgs'
+                try:
+                    import subprocess
+                    result = subprocess.run(
+                        ['ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
+                         f'root@{binhost_ip}',
+                         f'find {binhost_path} -name "*.gpkg.tar" 2>/dev/null | wc -l; '
+                         f'du -sb {binhost_path} 2>/dev/null | cut -f1'],
+                        capture_output=True, text=True, timeout=15)
+                    lines = result.stdout.strip().split('\n')
+                    pkg_count = int(lines[0]) if lines[0].strip().isdigit() else 0
+                    total_bytes = int(lines[1]) if len(lines) > 1 and lines[1].strip().isdigit() else 0
+                    _binhost_cache = {
+                        'ts': now,
+                        'data': {'packages': pkg_count, 'size_mb': round(total_bytes / 1048576),
+                                 'binhost_ip': binhost_ip}
+                    }
+                except Exception as e:
+                    _binhost_cache = {
+                        'ts': now,
+                        'data': {'packages': 0, 'size_mb': 0,
+                                 'binhost_ip': binhost_ip, 'error': str(e)}
+                    }
             self.send_json(_binhost_cache['data'])
 
         elif path == '/api/v1/binhost/status':

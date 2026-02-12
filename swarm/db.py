@@ -6,12 +6,45 @@ Thread-safe via connection-per-thread pattern.
 """
 
 import json
+import re
 import sqlite3
 import threading
 import time
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
+
+# Regex to detect versioned package atoms (e.g., "cat/pkg-1.2.3-r1")
+# Matches: category/package_name-version where version starts with a digit
+_VERSION_RE = re.compile(
+    r'^(?P<cat>[a-zA-Z0-9_+-]+)/(?P<pn>[a-zA-Z0-9_+]+(?:-[a-zA-Z][a-zA-Z0-9_+]*)*)'
+    r'-(?P<ver>\d[\d._]*[a-z]?(?:_(?:alpha|beta|pre|rc|p)\d*)*(?:-r\d+)?)$'
+)
+
+
+def normalize_atom(atom: str) -> str:
+    """Normalize a Portage package atom for emerge compatibility.
+
+    Versioned atoms like 'cat/pkg-1.0' get '=' prefix: '=cat/pkg-1.0'
+    Unversioned atoms like 'cat/pkg' stay as-is.
+    Already-prefixed atoms like '=cat/pkg-1.0' are returned unchanged.
+    """
+    if not atom or atom.startswith(('>=', '<=', '<', '>', '~', '!')):
+        return atom  # Don't touch comparison operators
+
+    bare = atom.lstrip('=')
+    # Separate slot suffix
+    slot = ''
+    if ':' in bare:
+        bare, slot = bare.split(':', 1)
+        slot = ':' + slot
+
+    has_version = bool(_VERSION_RE.match(bare))
+    if has_version and not atom.startswith('='):
+        return f'={bare}{slot}'
+    elif not has_version and atom.startswith('='):
+        return f'{bare}{slot}'
+    return atom
 
 log = logging.getLogger('swarm-v3')
 
@@ -393,7 +426,8 @@ class SwarmDB:
     def queue_packages(self, packages: List[str], session_id: str = None) -> int:
         """Add packages to the queue. Returns count added."""
         added = 0
-        for pkg in packages:
+        for raw_pkg in packages:
+            pkg = normalize_atom(raw_pkg)
             # Skip if already in queue with same session (or any active status)
             existing = self.fetchone("""
                 SELECT id FROM queue

@@ -310,9 +310,9 @@ class Scheduler:
 
         return stolen
 
-    def reclaim_offline_work(self, timeout_hours: int = 2):
+    def reclaim_offline_work(self, timeout_minutes: int = 5):
         """Reclaim work from offline/timed-out drones."""
-        cutoff = time.time() - (timeout_hours * 3600)
+        cutoff = time.time() - (timeout_minutes * 60)
         delegated = self.db.get_delegated_packages()
         reclaimed = 0
 
@@ -328,7 +328,7 @@ class Scheduler:
                 reason = "drone offline"
             elif pkg['assigned_at'] and pkg['assigned_at'] < cutoff:
                 should_reclaim = True
-                reason = f"build timeout (>{timeout_hours}h)"
+                reason = f"build timeout (>{timeout_minutes}m)"
 
             if should_reclaim:
                 drone_name = self.db.get_drone_name(drone_id)

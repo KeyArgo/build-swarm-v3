@@ -7,7 +7,7 @@
 // Use same hostname as current page but on port 8100
 // When running locally, fall back to the production control plane
 const V3_HOST = location.hostname === 'localhost' || location.hostname === '127.0.0.1'
-  ? '10.0.0.199' : location.hostname;
+  ? '10.0.0.100' : location.hostname;
 const V3_API = `http://${V3_HOST}:8100/api/v1`;
 const ADMIN_API = '/admin/api';
 const REFRESH_MS = 5000;
