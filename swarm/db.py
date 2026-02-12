@@ -21,6 +21,19 @@ if not SCHEMA_FILE.exists():
     SCHEMA_FILE = Path(__file__).resolve().parent.parent / 'schema.sql'
 DEFAULT_DB_PATH = '/var/lib/build-swarm-v3/swarm.db'
 
+# Packages that can NEVER be removed from a drone's @world.
+# Deleting any of these bricks the drone. Protected in the allowlist DB
+# and always included in the clean diff even if the admin empties the allowlist.
+CRITICAL_PACKAGES = frozenset([
+    'sys-apps/portage',
+    'sys-devel/gcc',
+    'sys-devel/binutils',
+    'sys-libs/glibc',
+    'dev-lang/python',
+    'net-misc/openssh',
+    'sys-apps/openrc',
+])
+
 
 class SwarmDB:
     """Thread-safe SQLite database for the build swarm."""
@@ -113,6 +126,7 @@ class SwarmDB:
                     drone_id TEXT,
                     package TEXT NOT NULL,
                     reason TEXT,
+                    protected INTEGER DEFAULT 0,
                     added_at REAL DEFAULT (strftime('%s','now')),
                     added_by TEXT
                 )
@@ -124,27 +138,67 @@ class SwarmDB:
             # Seed global defaults if table is empty
             count = conn.execute("SELECT COUNT(*) FROM drone_allowlist").fetchone()[0]
             if count == 0:
+                # Matches drone.spec world_packages + essential infra packages.
+                # Critical packages get protected=1 (cannot be deleted via API).
                 defaults = [
-                    ('sys-apps/portage', 'Package manager (essential)'),
-                    ('dev-vcs/git', 'Version control (portage sync)'),
-                    ('net-misc/openssh', 'Remote access'),
-                    ('app-admin/sudo', 'Privilege escalation'),
-                    ('net-misc/dhcpcd', 'Network (DHCP)'),
+                    # -- Critical (protected=1) -- from drone.spec world_packages --
+                    ('sys-apps/portage',    'Package manager (essential)',          1),
+                    ('sys-devel/gcc',       'Compiler toolchain (essential)',       1),
+                    ('sys-devel/binutils',  'Linker/assembler (essential)',         1),
+                    ('sys-libs/glibc',      'C library (essential)',               1),
+                    ('dev-lang/python',     'Python runtime (essential)',           1),
+                    ('net-misc/openssh',    'Remote access (essential)',            1),
+                    ('sys-apps/openrc',     'Init system (essential)',             1),
+                    # -- drone.spec world_packages (not critical but required) --
+                    ('net-misc/rsync',      'Portage sync (drone.spec)'),
+                    ('app-misc/screen',     'Session persistence (drone.spec)'),
+                    ('app-portage/gentoolkit', 'Portage utilities (drone.spec)'),
+                    # -- Infrastructure packages --
+                    ('dev-vcs/git',         'Version control (portage sync)'),
+                    ('app-admin/sudo',      'Privilege escalation'),
+                    ('net-misc/dhcpcd',     'Network (DHCP)'),
                     ('sys-kernel/gentoo-kernel-bin', 'Kernel'),
                     ('sys-kernel/linux-firmware', 'Hardware firmware'),
-                    ('sys-boot/grub', 'Bootloader'),
-                    ('app-portage/gentoolkit', 'Portage utilities'),
-                    ('net-misc/curl', 'HTTP client'),
+                    ('sys-boot/grub',       'Bootloader'),
+                    ('net-misc/curl',       'HTTP client'),
                 ]
-                for pkg, reason in defaults:
+                for entry in defaults:
+                    pkg, reason = entry[0], entry[1]
+                    protected = entry[2] if len(entry) > 2 else 0
                     conn.execute(
-                        "INSERT INTO drone_allowlist (drone_id, package, reason, added_by) "
-                        "VALUES (NULL, ?, ?, 'system')",
-                        (pkg, reason))
+                        "INSERT INTO drone_allowlist (drone_id, package, reason, protected, added_by) "
+                        "VALUES (NULL, ?, ?, ?, 'system')",
+                        (pkg, reason, protected))
                 conn.commit()
-                log.info(f"Seeded {len(defaults)} global allowlist defaults")
+                log.info(f"Seeded {len(defaults)} global allowlist defaults ({sum(1 for e in defaults if len(e) > 2 and e[2])} protected)")
         except Exception as e:
             log.debug(f"Allowlist migration note: {e}")
+
+        # Migration: add protected column if missing + mark critical entries
+        try:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(drone_allowlist)").fetchall()}
+            if 'protected' not in cols:
+                conn.execute("ALTER TABLE drone_allowlist ADD COLUMN protected INTEGER DEFAULT 0")
+                conn.commit()
+                log.info("Added protected column to drone_allowlist")
+            # Ensure critical packages are always marked protected
+            for pkg in CRITICAL_PACKAGES:
+                conn.execute(
+                    "UPDATE drone_allowlist SET protected = 1 WHERE package = ? AND protected = 0",
+                    (pkg,))
+            # Ensure critical packages exist in global allowlist
+            existing = {r[0] for r in conn.execute(
+                "SELECT package FROM drone_allowlist WHERE drone_id IS NULL").fetchall()}
+            for pkg in CRITICAL_PACKAGES:
+                if pkg not in existing:
+                    conn.execute(
+                        "INSERT INTO drone_allowlist (drone_id, package, reason, protected, added_by) "
+                        "VALUES (NULL, ?, 'Critical system package (auto-added)', 1, 'system')",
+                        (pkg,))
+                    log.info(f"Auto-added missing critical package to allowlist: {pkg}")
+            conn.commit()
+        except Exception as e:
+            log.debug(f"Protected column migration note: {e}")
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         """Execute SQL with automatic retry on lock."""
@@ -940,6 +994,14 @@ class SwarmDB:
         """, (drone_name,))
         return {r['package'] for r in rows}
 
+    def get_allowlist_with_critical(self, drone_name: str) -> set:
+        """Get allowed packages for a drone, guaranteed to include CRITICAL_PACKAGES.
+
+        Even if the admin empties the allowlist, this always returns at least
+        the 7 critical system packages that prevent bricking.
+        """
+        return self.get_allowlist_packages(drone_name) | CRITICAL_PACKAGES
+
     def add_allowlist(self, package: str, drone_name: str = None,
                       reason: str = None, added_by: str = 'admin') -> int:
         """Add a package to the allowlist. Returns the new row ID."""
@@ -950,20 +1012,44 @@ class SwarmDB:
         return cursor.lastrowid
 
     def remove_allowlist(self, entry_id: int) -> bool:
-        """Remove an allowlist entry by ID."""
+        """Remove an allowlist entry by ID. Refuses to delete protected entries.
+
+        Returns True if deleted, False if not found.
+        Raises ValueError if the entry is protected.
+        """
+        row = self.fetchone("SELECT package, protected FROM drone_allowlist WHERE id = ?", (entry_id,))
+        if not row:
+            return False
+        if row['protected']:
+            raise ValueError(f"Cannot delete protected package '{row['package']}' — it is critical for drone operation")
         cursor = self.execute(
-            "DELETE FROM drone_allowlist WHERE id = ?", (entry_id,))
+            "DELETE FROM drone_allowlist WHERE id = ? AND protected = 0", (entry_id,))
         return cursor.rowcount > 0
 
     def remove_allowlist_by_package(self, package: str, drone_name: str = None) -> bool:
-        """Remove an allowlist entry by package name and optional drone."""
+        """Remove an allowlist entry by package name and optional drone.
+
+        Refuses to delete protected entries. Raises ValueError if protected.
+        """
+        # Check if this is a protected entry
+        if drone_name:
+            row = self.fetchone(
+                "SELECT protected FROM drone_allowlist WHERE package = ? AND drone_id = ?",
+                (package, drone_name))
+        else:
+            row = self.fetchone(
+                "SELECT protected FROM drone_allowlist WHERE package = ? AND drone_id IS NULL",
+                (package,))
+        if row and row['protected']:
+            raise ValueError(f"Cannot delete protected package '{package}' — it is critical for drone operation")
+
         if drone_name:
             cursor = self.execute(
-                "DELETE FROM drone_allowlist WHERE package = ? AND drone_id = ?",
+                "DELETE FROM drone_allowlist WHERE package = ? AND drone_id = ? AND protected = 0",
                 (package, drone_name))
         else:
             cursor = self.execute(
-                "DELETE FROM drone_allowlist WHERE package = ? AND drone_id IS NULL",
+                "DELETE FROM drone_allowlist WHERE package = ? AND drone_id IS NULL AND protected = 0",
                 (package,))
         return cursor.rowcount > 0
 

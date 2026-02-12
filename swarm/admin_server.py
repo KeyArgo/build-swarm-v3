@@ -18,12 +18,17 @@ from urllib.parse import urlparse, parse_qs
 
 from . import __version__
 from . import config as cfg
+from .db import CRITICAL_PACKAGES
 
 log = logging.getLogger('swarm-v3')
 
 # ── Admin secret management ──────────────────────────────────────
 
 _admin_secret: str = ''
+
+# ── Clean preflight tokens (in-memory, keyed by token string) ────
+# Each value: {'drone': name, 'expires': timestamp, 'diff': {...}}
+_preflight_tokens: dict = {}
 
 def _load_or_generate_secret() -> str:
     """Load admin secret from env, file, or auto-generate.
@@ -274,7 +279,11 @@ class AdminHandler(BaseHTTPRequestHandler):
                 self.send_error_json(400, 'Invalid allowlist entry ID')
                 return
             if cp.db:
-                ok = cp.db.remove_allowlist(entry_id)
+                try:
+                    ok = cp.db.remove_allowlist(entry_id)
+                except ValueError as e:
+                    self.send_error_json(403, str(e))
+                    return
                 if ok:
                     self.send_json({'status': 'ok', 'deleted': entry_id})
                 else:
@@ -607,9 +616,19 @@ class AdminHandler(BaseHTTPRequestHandler):
                 self.send_error_json(500, 'Database not available')
             return
 
-        if path.startswith('/admin/api/drones/') and path.endswith('/clean'):
+        if path.startswith('/admin/api/drones/') and path.endswith('/clean/preflight'):
             drone_name = path.split('/')[4]
-            self._handle_drone_clean(cp, drone_name, body)
+            self._handle_clean_preflight(cp, drone_name)
+            return
+
+        if path.startswith('/admin/api/drones/') and path.endswith('/clean/execute'):
+            drone_name = path.split('/')[4]
+            self._handle_clean_execute(cp, drone_name, body)
+            return
+
+        # Legacy /clean endpoint — redirect to new flow
+        if path.startswith('/admin/api/drones/') and path.endswith('/clean'):
+            self.send_error_json(410, 'The /clean endpoint has been replaced. Use /clean/preflight then /clean/execute.')
             return
 
         # Binhost stubs (Phase 5)
@@ -825,8 +844,14 @@ class AdminHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_error_json(500, f'SSH failed: {e}')
 
-    def _handle_drone_clean(self, cp, drone_name: str, body: dict):
-        """Clean a drone: switch to base profile, write minimal @world, depclean."""
+    def _handle_clean_preflight(self, cp, drone_name: str):
+        """Phase 1 of clean: run all safety checks, compute diff, issue token.
+
+        Returns a one-time preflight_token (valid 5 minutes) that must be
+        passed to /clean/execute along with the typed drone name.
+        """
+        import subprocess
+
         node = cp.db.get_node_by_name(drone_name) if cp.db else None
         if not node:
             self.send_error_json(404, f'Drone not found: {drone_name}')
@@ -837,37 +862,254 @@ class AdminHandler(BaseHTTPRequestHandler):
             self.send_error_json(400, f'No IP for drone {drone_name}')
             return
 
-        dry_run = body.get('dry_run', False)
+        checks = []
 
-        # Get allowlist for this drone
-        allowed = cp.db.get_allowlist_packages(drone_name)
-        world_content = '\n'.join(sorted(allowed))
+        # Check 1: Drone not actively building
+        current_task = node.get('current_task')
+        delegated = cp.db.get_delegated_packages(node['id']) if cp.db else []
+        is_building = bool(current_task) or any(p.get('building_since') for p in delegated)
+        checks.append({
+            'name': 'not_building',
+            'passed': not is_building,
+            'detail': f'Currently building: {current_task}' if is_building else 'Idle',
+        })
 
+        # Check 2: SSH reachable
+        ssh_ok = False
         try:
-            import subprocess
-            steps = []
+            result = subprocess.run(
+                ['ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
+                 '-o', 'BatchMode=yes', f'root@{ip}', 'echo ok'],
+                capture_output=True, text=True, timeout=10)
+            ssh_ok = result.returncode == 0 and 'ok' in result.stdout
+        except Exception:
+            pass
+        checks.append({
+            'name': 'ssh_reachable',
+            'passed': ssh_ok,
+            'detail': f'SSH to root@{ip}' + (' OK' if ssh_ok else ' FAILED'),
+        })
 
-            if dry_run:
-                steps.append(f'Would write {len(allowed)} packages to @world')
-                steps.append('Would switch to base profile')
-                steps.append('Would run emerge --depclean')
-                self.send_json({
-                    'status': 'dry_run',
-                    'drone': drone_name,
-                    'steps': steps,
-                    'world_packages': sorted(allowed),
-                })
+        if not ssh_ok:
+            self.send_json({
+                'status': 'preflight_failed',
+                'drone': drone_name,
+                'checks': checks,
+                'error': 'Cannot reach drone via SSH — aborting preflight',
+            })
+            return
+
+        # Check 3: Immutable flags on world file
+        immutable = False
+        try:
+            result = subprocess.run(
+                ['ssh', '-o', 'ConnectTimeout=3', '-o', 'StrictHostKeyChecking=no',
+                 f'root@{ip}', 'lsattr /var/lib/portage/world 2>/dev/null'],
+                capture_output=True, text=True, timeout=10)
+            immutable = 'i' in result.stdout.split()[0] if result.stdout.strip() else False
+        except Exception:
+            pass
+        checks.append({
+            'name': 'immutable_flags',
+            'passed': True,  # Not a blocker — we handle it
+            'detail': 'World file is immutable (will chattr -i before write)' if immutable else 'World file is mutable',
+            'immutable': immutable,
+        })
+
+        # Check 4: Get current @world from drone
+        current_world = set()
+        try:
+            result = subprocess.run(
+                ['ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
+                 f'root@{ip}', 'cat /var/lib/portage/world 2>/dev/null'],
+                capture_output=True, text=True, timeout=10)
+            current_world = {w.strip() for w in result.stdout.strip().split('\n') if w.strip()}
+        except Exception:
+            pass
+
+        # Check 5: Compute proposed @world (with critical guarantees)
+        proposed = cp.db.get_allowlist_with_critical(drone_name) if cp.db else set()
+        checks.append({
+            'name': 'allowlist_sanity',
+            'passed': len(proposed) >= len(CRITICAL_PACKAGES),
+            'detail': f'{len(proposed)} packages in proposed @world ({len(CRITICAL_PACKAGES)} critical guaranteed)',
+        })
+
+        # Check 6: Critical packages status
+        critical_status = []
+        for pkg in sorted(CRITICAL_PACKAGES):
+            critical_status.append({
+                'package': pkg,
+                'in_current': pkg in current_world,
+                'in_proposed': pkg in proposed,
+            })
+        all_critical_present = all(c['in_proposed'] for c in critical_status)
+        checks.append({
+            'name': 'critical_packages',
+            'passed': all_critical_present,
+            'detail': f'All {len(CRITICAL_PACKAGES)} critical packages present in proposed @world',
+            'packages': critical_status,
+        })
+
+        # Compute diff
+        removing = sorted(current_world - proposed)
+        adding = sorted(proposed - current_world)
+        keeping = sorted(current_world & proposed)
+
+        diff = {
+            'current_count': len(current_world),
+            'proposed_count': len(proposed),
+            'removing': removing,
+            'removing_count': len(removing),
+            'adding': adding,
+            'adding_count': len(adding),
+            'keeping': keeping,
+            'keeping_count': len(keeping),
+        }
+
+        # All checks must pass
+        all_passed = all(c['passed'] for c in checks)
+
+        if not all_passed:
+            self.send_json({
+                'status': 'preflight_failed',
+                'drone': drone_name,
+                'checks': checks,
+                'diff': diff,
+                'error': 'One or more pre-flight checks failed',
+            })
+            return
+
+        # Issue one-time token (5-minute expiry)
+        token = secrets.token_hex(24)
+        _preflight_tokens[token] = {
+            'drone': drone_name,
+            'ip': ip,
+            'expires': time.time() + 300,
+            'diff': diff,
+            'proposed': sorted(proposed),
+            'immutable': immutable,
+        }
+
+        # Prune expired tokens
+        now = time.time()
+        expired = [t for t, v in _preflight_tokens.items() if v['expires'] < now]
+        for t in expired:
+            del _preflight_tokens[t]
+
+        self.send_json({
+            'status': 'preflight_ok',
+            'drone': drone_name,
+            'checks': checks,
+            'diff': diff,
+            'critical_packages': critical_status,
+            'preflight_token': token,
+            'expires_in_s': 300,
+            'confirm_instructions': f'To execute, POST to /clean/execute with preflight_token and confirm_name="{drone_name}"',
+        })
+
+    def _handle_clean_execute(self, cp, drone_name: str, body: dict):
+        """Phase 2 of clean: validate token, write @world, verify, depclean.
+
+        Requires:
+          - preflight_token: from Phase 1 (valid, unexpired, matching drone)
+          - confirm_name: must exactly match drone_name
+        """
+        import subprocess
+        from .events import add_event
+
+        token = body.get('preflight_token')
+        confirm_name = body.get('confirm_name')
+
+        # Validate token
+        if not token or token not in _preflight_tokens:
+            self.send_error_json(403, 'Invalid or expired preflight token. Run preflight again.')
+            return
+
+        token_data = _preflight_tokens[token]
+        if token_data['drone'] != drone_name:
+            self.send_error_json(403, f'Token was issued for {token_data["drone"]}, not {drone_name}')
+            return
+
+        if time.time() > token_data['expires']:
+            del _preflight_tokens[token]
+            self.send_error_json(403, 'Preflight token expired (5-minute limit). Run preflight again.')
+            return
+
+        # Validate typed confirmation
+        if confirm_name != drone_name:
+            self.send_error_json(400,
+                f'Confirmation mismatch: you typed "{confirm_name}" but the drone is "{drone_name}". '
+                f'Type the exact drone name to confirm.')
+            return
+
+        # Consume the token (one-time use)
+        del _preflight_tokens[token]
+
+        ip = token_data['ip']
+        proposed = token_data['proposed']
+        immutable = token_data['immutable']
+        world_content = '\n'.join(proposed)
+
+        # Re-check: drone not building (race condition guard)
+        node = cp.db.get_node_by_name(drone_name) if cp.db else None
+        if node:
+            current_task = node.get('current_task')
+            delegated = cp.db.get_delegated_packages(node['id']) if cp.db else []
+            is_building = bool(current_task) or any(p.get('building_since') for p in delegated)
+            if is_building:
+                self.send_error_json(409,
+                    f'Drone started building since preflight ({current_task}). Aborting clean.')
                 return
 
-            # Step 1: Write @world
-            subprocess.run(
-                ['ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
-                 f'root@{ip}',
-                 f'echo "{world_content}" > /var/lib/portage/world'],
-                capture_output=True, text=True, timeout=15)
-            steps.append(f'Wrote {len(allowed)} packages to @world')
+        steps = []
 
-            # Step 2: Switch profile
+        try:
+            # Step 1: Remove immutable flag if needed
+            if immutable:
+                result = subprocess.run(
+                    ['ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
+                     f'root@{ip}', 'chattr -i /var/lib/portage/world'],
+                    capture_output=True, text=True, timeout=10)
+                if result.returncode != 0:
+                    self.send_error_json(500,
+                        f'Failed to remove immutable flag: {result.stderr.strip()}')
+                    return
+                steps.append('Removed immutable flag from world file')
+
+            # Step 2: Write @world via stdin (safe — no shell escaping issues)
+            result = subprocess.run(
+                ['ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
+                 f'root@{ip}', 'cat > /var/lib/portage/world'],
+                input=world_content + '\n',
+                capture_output=True, text=True, timeout=15)
+            if result.returncode != 0:
+                self.send_error_json(500,
+                    f'Failed to write world file: {result.stderr.strip()}')
+                return
+            steps.append(f'Wrote {len(proposed)} packages to @world')
+
+            # Step 3: Verify the write
+            result = subprocess.run(
+                ['ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
+                 f'root@{ip}', 'wc -l < /var/lib/portage/world'],
+                capture_output=True, text=True, timeout=10)
+            written_count = int(result.stdout.strip()) if result.stdout.strip().isdigit() else -1
+            if written_count != len(proposed):
+                self.send_error_json(500,
+                    f'Write verification failed: expected {len(proposed)} lines, got {written_count}')
+                return
+            steps.append(f'Verified: {written_count} lines written')
+
+            # Step 4: Restore immutable flag
+            if immutable:
+                subprocess.run(
+                    ['ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
+                     f'root@{ip}', 'chattr +i /var/lib/portage/world'],
+                    capture_output=True, text=True, timeout=10)
+                steps.append('Restored immutable flag on world file')
+
+            # Step 5: Switch profile to base
             result = subprocess.run(
                 ['ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
                  f'root@{ip}',
@@ -875,7 +1117,7 @@ class AdminHandler(BaseHTTPRequestHandler):
                 capture_output=True, text=True, timeout=15)
             steps.append(f'Profile switch: {result.stdout.strip() or "done"}')
 
-            # Step 3: Depclean (background, can take a while)
+            # Step 6: Start depclean in background
             subprocess.run(
                 ['ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
                  f'root@{ip}',
@@ -883,11 +1125,21 @@ class AdminHandler(BaseHTTPRequestHandler):
                 capture_output=True, text=True, timeout=15)
             steps.append('Started depclean in background (check /tmp/depclean.log on drone)')
 
+            # Log event
+            add_event('clean', f'Cleaned {drone_name}: wrote {len(proposed)} packages to @world',
+                      details={
+                          'drone': drone_name,
+                          'removed': token_data['diff']['removing'],
+                          'added': token_data['diff']['adding'],
+                          'proposed_count': len(proposed),
+                      })
+
             self.send_json({
                 'status': 'ok',
                 'drone': drone_name,
                 'steps': steps,
-                'world_packages': sorted(allowed),
+                'diff': token_data['diff'],
+                'world_packages': proposed,
             })
         except Exception as e:
             self.send_error_json(500, f'Clean failed: {e}')

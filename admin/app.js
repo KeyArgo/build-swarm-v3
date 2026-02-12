@@ -836,11 +836,16 @@ async function refreshAllowlist() {
   tbody.innerHTML = entries.map(e => {
     const scope = e.drone_id || 'global';
     const scopeColor = scope === 'global' ? 'var(--cyan)' : 'var(--green)';
-    return `<tr>
-      <td><code>${esc(e.package)}</code></td>
+    const isProtected = e.protected === 1;
+    const lockIcon = isProtected ? '<span title="Protected — critical system package" style="color:var(--yellow);margin-right:0.25rem">&#x1f512;</span>' : '';
+    const actionBtn = isProtected
+      ? '<span style="color:var(--text-dim);font-size:0.7rem" title="Protected — cannot delete">locked</span>'
+      : `<button class="btn danger" style="padding:0.2rem 0.5rem;font-size:0.7rem" onclick="removeAllowlistEntry(${e.id})" title="Remove">Del</button>`;
+    return `<tr${isProtected ? ' style="opacity:0.85"' : ''}>
+      <td>${lockIcon}<code>${esc(e.package)}</code></td>
       <td><span style="color:${scopeColor}">${esc(scope)}</span></td>
       <td style="color:var(--text-dim)">${esc(e.reason || '-')}</td>
-      <td><button class="btn danger" style="padding:0.2rem 0.5rem;font-size:0.7rem" onclick="removeAllowlistEntry(${e.id})" title="Remove">Del</button></td>
+      <td>${actionBtn}</td>
     </tr>`;
   }).join('');
 }
@@ -873,6 +878,8 @@ async function removeAllowlistEntry(id) {
 
   if (result && result.status === 'ok') {
     await refreshAllowlist();
+  } else if (result && result.error) {
+    alert(result.error);
   }
 }
 
@@ -923,7 +930,9 @@ async function runBloatAudit() {
   $('#audit-excess').style.color = data.excess_count > 0 ? 'var(--red)' : 'var(--green)';
 
   const cleanBtn = $('#clean-btn');
-  if (cleanBtn) cleanBtn.style.display = data.excess_count > 0 ? 'inline-block' : 'none';
+  if (cleanBtn) cleanBtn.style.display = 'inline-block';
+  // Hide the clean flow if it was open from a previous drone
+  cancelCleanFlow();
 
   let html = `<div style="margin-bottom:0.5rem;font-size:0.85rem">
     <strong>Profile:</strong> <code>${esc(data.profile)}</code>
@@ -946,22 +955,146 @@ async function runBloatAudit() {
   $('#audit-details').innerHTML = html;
 }
 
-async function runDroneClean() {
+// ── Multi-step Clean Flow ──
+
+let _cleanToken = null;
+let _cleanDroneName = null;
+
+async function startCleanFlow() {
   const name = $('#audit-drone-select')?.value;
   if (!name) return;
-  if (!confirm(`Clean drone "${name}"?\n\nThis will:\n1. Write minimal @world from allowlist\n2. Switch to base profile\n3. Run emerge --depclean in background`)) return;
 
-  const result = await adminPost(`/drones/${encodeURIComponent(name)}/clean`, {});
-  if (result && !result.error) {
+  _cleanDroneName = name;
+  _cleanToken = null;
+
+  const flow = $('#clean-flow');
+  flow.style.display = 'block';
+  $('#clean-checks').innerHTML = '<span style="color:var(--text-dim)">Running pre-flight checks...</span>';
+  $('#clean-critical').innerHTML = '';
+  $('#clean-diff').innerHTML = '';
+  $('#clean-confirm').style.display = 'none';
+  $('#clean-result').innerHTML = '';
+
+  const result = await adminPost(`/drones/${encodeURIComponent(name)}/clean/preflight`, {});
+  if (!result) {
+    $('#clean-checks').innerHTML = '<span style="color:var(--red)">No response from admin API</span>';
+    return;
+  }
+
+  // Display checks
+  const checks = result.checks || [];
+  let checksHtml = checks.map(c => {
+    const icon = c.passed
+      ? '<span style="color:var(--green)">PASS</span>'
+      : '<span style="color:var(--red)">FAIL</span>';
+    return `<div style="margin-bottom:0.25rem">[${icon}] <strong>${esc(c.name)}</strong>: ${esc(c.detail)}</div>`;
+  }).join('');
+  $('#clean-checks').innerHTML = checksHtml;
+
+  // Display critical packages
+  const critical = result.critical_packages || [];
+  if (critical.length > 0) {
+    let critHtml = '<div style="margin-top:0.5rem"><strong style="color:var(--yellow)">Critical System Packages:</strong>';
+    critHtml += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:0.25rem;margin-top:0.25rem">';
+    for (const c of critical) {
+      const curIcon = c.in_current ? '<span style="color:var(--green)">&#10003;</span>' : '<span style="color:var(--red)">&#10007;</span>';
+      const proIcon = c.in_proposed ? '<span style="color:var(--green)">&#10003;</span>' : '<span style="color:var(--red)">&#10007;</span>';
+      critHtml += `<div style="font-size:0.8rem"><code>${esc(c.package)}</code> cur:${curIcon} new:${proIcon}</div>`;
+    }
+    critHtml += '</div></div>';
+    $('#clean-critical').innerHTML = critHtml;
+  }
+
+  // Display diff
+  const diff = result.diff || {};
+  let diffHtml = `<div><strong>@world Diff:</strong> ${diff.current_count || '?'} current &rarr; ${diff.proposed_count || '?'} proposed</div>`;
+
+  const removing = diff.removing || [];
+  const adding = diff.adding || [];
+  const keeping = diff.keeping || [];
+
+  if (removing.length > 0) {
+    diffHtml += `<div style="margin-top:0.5rem"><strong style="color:var(--red)">Removing (${removing.length}):</strong>
+      <div style="max-height:150px;overflow-y:auto;padding:0.5rem;background:var(--surface);border-radius:4px;margin-top:0.25rem">
+      ${removing.map(p => `<div style="color:var(--red)">- <code>${esc(p)}</code></div>`).join('')}
+      </div></div>`;
+  }
+  if (adding.length > 0) {
+    diffHtml += `<div style="margin-top:0.5rem"><strong style="color:var(--green)">Adding (${adding.length}):</strong>
+      <div style="max-height:150px;overflow-y:auto;padding:0.5rem;background:var(--surface);border-radius:4px;margin-top:0.25rem">
+      ${adding.map(p => `<div style="color:var(--green)">+ <code>${esc(p)}</code></div>`).join('')}
+      </div></div>`;
+  }
+  if (keeping.length > 0) {
+    diffHtml += `<div style="margin-top:0.5rem"><span style="color:var(--text-dim)">Keeping (${keeping.length}):</span>
+      <details style="margin-top:0.25rem"><summary style="color:var(--text-dim);cursor:pointer;font-size:0.8rem">show kept packages</summary>
+      <div style="max-height:150px;overflow-y:auto;padding:0.5rem;background:var(--surface);border-radius:4px">
+      ${keeping.map(p => `<div style="color:var(--text-dim)"><code>${esc(p)}</code></div>`).join('')}
+      </div></details></div>`;
+  }
+  $('#clean-diff').innerHTML = diffHtml;
+
+  // If preflight passed, show confirmation
+  if (result.status === 'preflight_ok' && result.preflight_token) {
+    _cleanToken = result.preflight_token;
+    $('#clean-confirm').style.display = 'block';
+    const inp = $('#clean-confirm-name');
+    inp.value = '';
+    inp.placeholder = name;
+    inp.focus();
+    checkCleanConfirmName();
+  } else {
+    $('#clean-result').innerHTML = `<div style="color:var(--red);margin-top:0.5rem">
+      <strong>Preflight failed.</strong> ${esc(result.error || 'Fix the issues above before cleaning.')}
+    </div>`;
+  }
+}
+
+function checkCleanConfirmName() {
+  const inp = $('#clean-confirm-name');
+  const btn = $('#clean-execute-btn');
+  if (!inp || !btn) return;
+  const matches = inp.value.trim() === _cleanDroneName;
+  btn.disabled = !matches;
+  btn.style.opacity = matches ? '1' : '0.5';
+}
+
+async function executeClean() {
+  if (!_cleanToken || !_cleanDroneName) return;
+
+  const btn = $('#clean-execute-btn');
+  btn.disabled = true;
+  btn.textContent = 'Executing...';
+  $('#clean-result').innerHTML = '<span style="color:var(--text-dim)">Executing clean...</span>';
+
+  const result = await adminPost(`/drones/${encodeURIComponent(_cleanDroneName)}/clean/execute`, {
+    preflight_token: _cleanToken,
+    confirm_name: _cleanDroneName,
+  });
+
+  _cleanToken = null;
+  $('#clean-confirm').style.display = 'none';
+
+  if (result && result.status === 'ok') {
     const steps = result.steps || [];
-    $('#audit-details').innerHTML = `<div style="margin-top:0.5rem;color:var(--green)">
-      <strong>Clean started:</strong>
-      ${steps.map(s => `<div style="margin-left:1rem">${esc(s)}</div>`).join('')}
+    $('#clean-result').innerHTML = `<div style="color:var(--green);margin-top:0.5rem">
+      <strong>Clean complete:</strong>
+      ${steps.map(s => `<div style="margin-left:1rem">&#10003; ${esc(s)}</div>`).join('')}
     </div>`;
     $('#clean-btn').style.display = 'none';
   } else {
-    $('#audit-details').innerHTML += `<div style="margin-top:0.5rem;color:var(--red)">Clean failed: ${esc(result?.error || 'Unknown')}</div>`;
+    $('#clean-result').innerHTML = `<div style="color:var(--red);margin-top:0.5rem">
+      <strong>Clean failed:</strong> ${esc(result?.error || 'Unknown error')}
+    </div>`;
   }
+
+  btn.textContent = 'Execute Clean';
+}
+
+function cancelCleanFlow() {
+  _cleanToken = null;
+  _cleanDroneName = null;
+  $('#clean-flow').style.display = 'none';
 }
 
 // ── Drone Log Viewer ──

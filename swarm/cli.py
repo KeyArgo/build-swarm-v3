@@ -1219,33 +1219,29 @@ def _drone_deny(args):
         scope = entry.get('drone_id') or 'global'
         if result and result.get('status') == 'ok':
             print(f'{C.BRED}Removed:{C.RESET} {args.package} (scope: {scope}, id: {entry["id"]})')
+        elif result and result.get('error') and 'protected' in result['error'].lower():
+            print(f'{C.RED}PROTECTED:{C.RESET} {args.package} is a critical system package and cannot be removed')
         else:
-            print(f'{C.RED}Error:{C.RESET} Failed to remove id {entry["id"]}')
+            err = result.get('error', 'Unknown error') if result else 'No response'
+            print(f'{C.RED}Error:{C.RESET} Failed to remove id {entry["id"]}: {err}')
 
 
 def _drone_clean(args):
-    """Clean a drone: switch to base profile, write minimal @world, depclean."""
+    """Clean a drone: two-phase preflight + execute with safety checks.
+
+    Phase 1 (automatic): Runs preflight checks — SSH, building status,
+    immutable flags, allowlist sanity, critical package verification.
+    Shows full diff of what will change.
+
+    Phase 2 (requires confirmation): Must type the exact drone name
+    to confirm. Uses one-time preflight token with 5-minute expiry.
+    """
     name = args.drone_name
     dry_run = args.dry_run if hasattr(args, 'dry_run') else False
 
-    if not dry_run:
-        print(f'{C.YELLOW}WARNING:{C.RESET} This will:')
-        print(f'  1. Write a minimal @world from the allowlist')
-        print(f'  2. Switch to base profile (default/linux/amd64/23.0)')
-        print(f'  3. Run emerge --depclean in background')
-        print()
-        try:
-            answer = input(f'  Clean drone {C.BOLD}{name}{C.RESET}? [y/N] ')
-        except (KeyboardInterrupt, EOFError):
-            print(f'\n{C.DIM}Aborted.{C.RESET}')
-            return
-        if answer.lower() != 'y':
-            print(f'{C.DIM}Aborted.{C.RESET}')
-            return
-
-    data = {'dry_run': dry_run}
-    print(f'{C.DIM}Cleaning {name}...{C.RESET}')
-    result = admin_post(f'/admin/api/drones/{name}/clean', data)
+    # ── Phase 1: Preflight ──────────────────────────────────────────
+    print(f'{C.DIM}Running preflight checks on {name}...{C.RESET}')
+    result = admin_post(f'/admin/api/drones/{name}/clean/preflight', {})
 
     if not result:
         print(f'{C.RED}Error:{C.RESET} No response from admin API')
@@ -1253,18 +1249,101 @@ def _drone_clean(args):
 
     if result.get('error'):
         print(f'{C.RED}Error:{C.RESET} {result["error"]}')
+
+    # Display checks
+    print_header(f'Pre-Flight Checks: {name}')
+    checks = result.get('checks', [])
+    for check in checks:
+        icon = f'{C.BGREEN}PASS{C.RESET}' if check['passed'] else f'{C.BRED}FAIL{C.RESET}'
+        print(f'  [{icon}] {check["name"]}: {check["detail"]}')
+
+    # Display critical packages
+    critical = result.get('critical_packages', [])
+    if critical:
+        print(f'\n  {C.BOLD}Critical System Packages:{C.RESET}')
+        for cp_entry in critical:
+            pkg = cp_entry['package']
+            in_cur = f'{C.GREEN}✓{C.RESET}' if cp_entry['in_current'] else f'{C.RED}✗{C.RESET}'
+            in_pro = f'{C.GREEN}✓{C.RESET}' if cp_entry['in_proposed'] else f'{C.RED}✗{C.RESET}'
+            print(f'    {pkg:<30s}  current:{in_cur}  proposed:{in_pro}')
+
+    # Display diff
+    diff = result.get('diff', {})
+    if diff:
+        print(f'\n  {C.BOLD}@world Diff:{C.RESET}  '
+              f'{diff.get("current_count", "?")} current → {diff.get("proposed_count", "?")} proposed')
+
+        removing = diff.get('removing', [])
+        adding = diff.get('adding', [])
+        keeping = diff.get('keeping', [])
+
+        if removing:
+            print(f'\n  {C.BRED}Removing ({len(removing)}):{C.RESET}')
+            for pkg in removing:
+                print(f'    {C.RED}- {pkg}{C.RESET}')
+
+        if adding:
+            print(f'\n  {C.BGREEN}Adding ({len(adding)}):{C.RESET}')
+            for pkg in adding:
+                print(f'    {C.GREEN}+ {pkg}{C.RESET}')
+
+        if keeping:
+            print(f'\n  {C.DIM}Keeping ({len(keeping)}):{C.RESET}')
+            for pkg in keeping:
+                print(f'    {C.DIM}  {pkg}{C.RESET}')
+
+    # Abort if preflight failed
+    if result.get('status') != 'preflight_ok':
+        print(f'\n{C.BRED}Preflight failed. Fix the issues above before cleaning.{C.RESET}')
         sys.exit(1)
 
-    status = result.get('status', 'unknown')
-    print_header(f'Clean {name} ({status})')
+    # Dry run stops here
+    if dry_run:
+        print(f'\n{C.BYELLOW}DRY RUN{C.RESET}: No changes made. '
+              f'Remove --dry-run to execute.')
+        return
 
-    for step in result.get('steps', []):
+    token = result.get('preflight_token')
+    if not token:
+        print(f'{C.RED}Error:{C.RESET} No preflight token received')
+        sys.exit(1)
+
+    # ── Phase 2: Confirmation + Execute ─────────────────────────────
+    print(f'\n{C.BYELLOW}{"═" * 60}{C.RESET}')
+    print(f'{C.BYELLOW}  DESTRUCTIVE OPERATION{C.RESET}')
+    print(f'{C.BYELLOW}{"═" * 60}{C.RESET}')
+    print(f'  This will rewrite @world on {C.BOLD}{name}{C.RESET} and run depclean.')
+    if diff.get('removing'):
+        print(f'  {C.BRED}{len(diff["removing"])} packages will be removed from @world.{C.RESET}')
+    print(f'\n  To confirm, type the exact drone name: {C.BOLD}{name}{C.RESET}')
+    print()
+    try:
+        typed = input(f'  Confirm drone name: ').strip()
+    except (KeyboardInterrupt, EOFError):
+        print(f'\n{C.DIM}Aborted.{C.RESET}')
+        return
+
+    if typed != name:
+        print(f'{C.RED}Mismatch:{C.RESET} You typed "{typed}" but the drone is "{name}". Aborted.')
+        return
+
+    print(f'\n{C.DIM}Executing clean on {name}...{C.RESET}')
+    exec_result = admin_post(f'/admin/api/drones/{name}/clean/execute', {
+        'preflight_token': token,
+        'confirm_name': name,
+    })
+
+    if not exec_result:
+        print(f'{C.RED}Error:{C.RESET} No response from admin API')
+        sys.exit(1)
+
+    if exec_result.get('error'):
+        print(f'{C.RED}Error:{C.RESET} {exec_result["error"]}')
+        sys.exit(1)
+
+    print_header(f'Clean Complete: {name}')
+    for step in exec_result.get('steps', []):
         print(f'  {C.GREEN}✓{C.RESET} {step}')
-
-    if result.get('world_packages'):
-        print(f'\n  {C.BOLD}@world ({len(result["world_packages"])}):{C.RESET}')
-        for pkg in result['world_packages']:
-            print(f'    {pkg}')
 
 
 def _drone_bloat_audit(args):
