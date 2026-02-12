@@ -170,6 +170,7 @@ CREATE TABLE IF NOT EXISTS drone_allowlist (
     drone_id TEXT,                      -- NULL = global default, or specific drone node name
     package TEXT NOT NULL,              -- e.g. 'net-misc/openssh', 'dev-vcs/git'
     reason TEXT,                        -- why it's allowed
+    protected INTEGER DEFAULT 0,        -- 1 = cannot be deleted via API (critical system package)
     added_at REAL DEFAULT (strftime('%s','now')),
     added_by TEXT
 );
