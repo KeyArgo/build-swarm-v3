@@ -33,7 +33,7 @@
   <header class="header">
     <div class="header-left">
       <span class="header-title">Build Swarm Admin</span>
-      <span class="header-version">v3.1.0</span>
+      <span class="header-version">v0.4.0-alpha</span>
     </div>
     <div class="header-right">
       <span class="connection-dot" title="Connection status"></span>
@@ -761,10 +761,61 @@
 
   <!-- ═══════════════════ TOPOLOGY TAB ═══════════════════ -->
   <div class="tab-content" id="tab-topology" role="tabpanel">
+    <!-- Self-Healing Status Cards -->
+    <div class="cards-row" id="self-healing-cards">
+      <div class="stat-card" id="stat-sh-healthy">
+        <div class="label">Healthy</div>
+        <div class="value green">-</div>
+      </div>
+      <div class="stat-card" id="stat-sh-escalating">
+        <div class="label">Escalating</div>
+        <div class="value amber">-</div>
+      </div>
+      <div class="stat-card" id="stat-sh-critical">
+        <div class="label">Critical</div>
+        <div class="value red">-</div>
+      </div>
+      <div class="stat-card" id="stat-sh-avg-latency">
+        <div class="label">Avg Ping</div>
+        <div class="value cyan">-</div>
+      </div>
+      <div class="stat-card" id="stat-sh-monitor">
+        <div class="label">Monitor</div>
+        <div class="value green">-</div>
+      </div>
+    </div>
+
     <div class="section-card">
       <h3>Network Topology</h3>
       <div id="topology-svg" style="display:flex;justify-content:center;padding:2rem">
         <div class="empty-state"><div class="spinner"></div></div>
+      </div>
+    </div>
+
+    <!-- Self-Healing Details -->
+    <div class="section-card">
+      <h3>Self-Healing Monitor
+        <span style="float:right;font-size:0.75rem;font-weight:400">
+          <button class="btn" style="font-size:0.7rem" onclick="refreshSelfHealing()">Refresh</button>
+        </span>
+      </h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Drone</th>
+              <th>Type</th>
+              <th>Status</th>
+              <th>Escalation</th>
+              <th>Last Ping</th>
+              <th>Latency</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="self-healing-tbody">
+            <tr><td colspan="7" class="empty-state">Loading...</td></tr>
+          </tbody>
+        </table>
       </div>
     </div>
   </div>

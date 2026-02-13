@@ -451,10 +451,38 @@ class AdminHandler(BaseHTTPRequestHandler):
             self._handle_drone_audit(cp, drone_name)
             return
 
-        # Per-drone log viewer
+        # Per-drone log viewer (events + build history)
         if path.startswith('/admin/api/drones/') and path.endswith('/log'):
             drone_name = path.split('/')[4]
             self._handle_drone_log(cp, drone_name, params)
+            return
+
+        # Per-drone system log viewer (via SSH)
+        if path.startswith('/admin/api/drones/') and path.endswith('/syslog'):
+            drone_name = path.split('/')[4]
+            self._handle_drone_syslog(cp, drone_name, params)
+            return
+
+        # Control plane log viewer
+        if path == '/admin/api/logs/control-plane':
+            self._handle_control_plane_log(params)
+            return
+
+        # Per-drone escalation state (v4)
+        if path.startswith('/admin/api/drones/') and path.endswith('/escalation'):
+            drone_name = path.split('/')[4]
+            self._handle_drone_escalation(cp, drone_name)
+            return
+
+        # Per-drone ping (v4)
+        if path.startswith('/admin/api/drones/') and path.endswith('/ping'):
+            drone_name = path.split('/')[4]
+            self._handle_drone_ping(cp, drone_name)
+            return
+
+        # Self-healing status (v4)
+        if path == '/admin/api/self-healing/status':
+            self._handle_self_healing_status(cp)
             return
 
         # Drone version management
@@ -464,6 +492,27 @@ class AdminHandler(BaseHTTPRequestHandler):
 
         if path == '/admin/api/drones/payload':
             self._handle_drone_payload()
+            return
+
+        # Payload versioning (v4)
+        if path == '/admin/api/payloads':
+            self._handle_payloads_list(cp)
+            return
+
+        if path == '/admin/api/payloads/status':
+            self._handle_payloads_status(cp)
+            return
+
+        if path.startswith('/admin/api/payloads/') and '/versions' in path:
+            # GET /admin/api/payloads/<type>/versions
+            payload_type = path.split('/')[4]
+            self._handle_payload_versions(cp, payload_type)
+            return
+
+        if path.startswith('/admin/api/payloads/') and '/deploy-log' in path:
+            # GET /admin/api/payloads/<type>/deploy-log
+            payload_type = path.split('/')[4]
+            self._handle_payload_deploy_log(cp, payload_type, params)
             return
 
         # V2 proxy (GET endpoints)
@@ -595,6 +644,35 @@ class AdminHandler(BaseHTTPRequestHandler):
                 self.send_json(cp.release_mgr.archive_release(version))
             else:
                 self.send_error_json(500, 'Release manager not available')
+            return
+
+        # ── Payload Versioning (v4) ──
+
+        if path == '/admin/api/payloads':
+            self._handle_payload_register(cp, body)
+            return
+
+        if path.startswith('/admin/api/payloads/') and path.endswith('/deploy'):
+            # POST /admin/api/payloads/<type>/<version>/deploy
+            parts = path.split('/')
+            payload_type = parts[4]
+            version = parts[5]
+            self._handle_payload_deploy(cp, payload_type, version, body)
+            return
+
+        if path.startswith('/admin/api/payloads/') and path.endswith('/rolling-deploy'):
+            # POST /admin/api/payloads/<type>/<version>/rolling-deploy
+            parts = path.split('/')
+            payload_type = parts[4]
+            version = parts[5]
+            self._handle_payload_rolling_deploy(cp, payload_type, version, body)
+            return
+
+        if path.startswith('/admin/api/payloads/') and path.endswith('/verify'):
+            # POST /admin/api/payloads/<type>/verify
+            payload_type = path.split('/')[4]
+            drone_name = body.get('drone')
+            self._handle_payload_verify(cp, payload_type, drone_name)
             return
 
         # ── Drone Allowlist + Clean ──
@@ -744,6 +822,181 @@ class AdminHandler(BaseHTTPRequestHandler):
             self.send_json({'error': f'Failed to fetch payload manifest: {e}',
                             'hint': 'The v2 gateway must be running to serve payloads'})
 
+    # ── Payload Versioning Handlers (v4) ──
+
+    def _handle_payloads_list(self, cp):
+        """List all payload versions."""
+        if not cp.db:
+            self.send_error_json(500, 'Database not available')
+            return
+        versions = cp.db.get_payload_versions(limit=100)
+        self.send_json({'versions': versions})
+
+    def _handle_payloads_status(self, cp):
+        """Get deployment status across all drones."""
+        from .payloads import get_manager
+        mgr = get_manager()
+        if not mgr:
+            self.send_error_json(500, 'Payload manager not initialized')
+            return
+        status = mgr.get_deployment_status()
+        self.send_json(status)
+
+    def _handle_payload_versions(self, cp, payload_type: str):
+        """List versions for a specific payload type."""
+        if not cp.db:
+            self.send_error_json(500, 'Database not available')
+            return
+        versions = cp.db.get_payload_versions(payload_type=payload_type, limit=50)
+        latest = cp.db.get_latest_payload_version(payload_type)
+        self.send_json({
+            'payload_type': payload_type,
+            'versions': versions,
+            'latest': latest,
+        })
+
+    def _handle_payload_deploy_log(self, cp, payload_type: str, params: dict):
+        """Get deployment log for a payload type."""
+        if not cp.db:
+            self.send_error_json(500, 'Database not available')
+            return
+        limit = int(params.get('limit', ['100'])[0])
+        # Filter by drone if specified
+        drone = params.get('drone', [None])[0]
+        if drone:
+            node = cp.db.get_node_by_name(drone)
+            if node:
+                history = cp.db.get_payload_deploy_history(drone_id=node['id'], limit=limit)
+            else:
+                history = []
+        else:
+            history = cp.db.get_payload_deploy_history(limit=limit)
+        # Filter by type
+        history = [h for h in history if h.get('payload_type') == payload_type]
+        self.send_json({'payload_type': payload_type, 'history': history})
+
+    def _handle_payload_register(self, cp, body: dict):
+        """Register a new payload version."""
+        from .payloads import get_manager
+        import base64
+
+        mgr = get_manager()
+        if not mgr:
+            self.send_error_json(500, 'Payload manager not initialized')
+            return
+
+        payload_type = body.get('type')
+        version = body.get('version')
+        content_b64 = body.get('content')  # Base64 encoded
+
+        if not all([payload_type, version, content_b64]):
+            self.send_error_json(400, 'Missing required fields: type, version, content')
+            return
+
+        try:
+            content = base64.b64decode(content_b64)
+        except Exception:
+            self.send_error_json(400, 'Invalid base64 content')
+            return
+
+        try:
+            result = mgr.register_version(
+                payload_type=payload_type,
+                version=version,
+                content=content,
+                description=body.get('description'),
+                notes=body.get('notes'),
+                created_by=body.get('created_by', 'admin'),
+            )
+            self.send_json({'status': 'ok', 'version': result}, 201)
+        except ValueError as e:
+            self.send_error_json(409, str(e))
+        except Exception as e:
+            self.send_error_json(500, str(e))
+
+    def _handle_payload_deploy(self, cp, payload_type: str, version: str, body: dict):
+        """Deploy a payload to a single drone."""
+        from .payloads import get_manager
+
+        mgr = get_manager()
+        if not mgr:
+            self.send_error_json(500, 'Payload manager not initialized')
+            return
+
+        drone_name = body.get('drone')
+        if not drone_name:
+            self.send_error_json(400, 'Missing "drone" field')
+            return
+
+        success, message = mgr.deploy_to_drone(
+            drone_name=drone_name,
+            payload_type=payload_type,
+            version=version,
+            deployed_by=body.get('deployed_by', 'admin'),
+            verify=body.get('verify', True),
+        )
+
+        self.send_json({
+            'status': 'ok' if success else 'error',
+            'drone': drone_name,
+            'payload_type': payload_type,
+            'version': version,
+            'message': message,
+        }, 200 if success else 500)
+
+    def _handle_payload_rolling_deploy(self, cp, payload_type: str, version: str, body: dict):
+        """Rolling deploy to multiple drones."""
+        from .payloads import get_manager
+
+        mgr = get_manager()
+        if not mgr:
+            self.send_error_json(500, 'Payload manager not initialized')
+            return
+
+        drone_names = body.get('drones')  # None = all outdated drones
+        results = mgr.rolling_deploy(
+            payload_type=payload_type,
+            version=version,
+            drone_names=drone_names,
+            deployed_by=body.get('deployed_by', 'admin'),
+            health_check=body.get('health_check', True),
+            rollback_on_fail=body.get('rollback_on_fail', True),
+        )
+
+        success_count = sum(1 for s, _ in results.values() if s)
+        fail_count = len(results) - success_count
+
+        self.send_json({
+            'status': 'ok' if fail_count == 0 else 'partial',
+            'payload_type': payload_type,
+            'version': version,
+            'success_count': success_count,
+            'fail_count': fail_count,
+            'results': {name: {'success': s, 'message': m} for name, (s, m) in results.items()},
+        })
+
+    def _handle_payload_verify(self, cp, payload_type: str, drone_name: str):
+        """Verify payload on a drone matches expected hash."""
+        from .payloads import get_manager
+
+        mgr = get_manager()
+        if not mgr:
+            self.send_error_json(500, 'Payload manager not initialized')
+            return
+
+        if not drone_name:
+            self.send_error_json(400, 'Missing "drone" field')
+            return
+
+        matches, remote_hash = mgr.verify_drone_payload(drone_name, payload_type)
+        self.send_json({
+            'drone': drone_name,
+            'payload_type': payload_type,
+            'matches': matches,
+            'remote_hash': remote_hash if isinstance(remote_hash, str) and len(remote_hash) == 64 else None,
+            'message': remote_hash if not matches else 'Hash matches',
+        })
+
     def _handle_drone_log(self, cp, drone_name: str, params: dict):
         """Combined event + build history log for a specific drone."""
         from .events import get_events_db
@@ -782,6 +1035,181 @@ class AdminHandler(BaseHTTPRequestHandler):
             'builds': [dict(b) for b in builds],
             'connections': connection_events,
         })
+
+    def _handle_drone_syslog(self, cp, drone_name: str, params: dict):
+        """Fetch system logs from a drone via SSH."""
+        import subprocess
+
+        node = cp.db.get_node_by_name(drone_name) if cp.db else None
+        if not node:
+            self.send_error_json(404, f'Drone not found: {drone_name}')
+            return
+
+        ip = node.get('tailscale_ip') or node.get('ip')
+        if not ip:
+            self.send_error_json(400, f'No IP for drone {drone_name}')
+            return
+
+        lines = int(params.get('lines', ['100'])[0])
+        log_type = params.get('type', ['swarm-drone'])[0]
+
+        # Map log type to file/command
+        log_sources = {
+            'swarm-drone': '/var/log/swarm-drone.log',
+            'emerge': '/var/log/emerge.log',
+            'portage': '/var/log/portage/elog/summary.log',
+            'messages': '/var/log/messages',
+            'dmesg': 'dmesg | tail -n',
+        }
+
+        log_path = log_sources.get(log_type, log_sources['swarm-drone'])
+
+        # Build SSH command
+        ssh_cfg = cp.db.fetchone(
+            "SELECT ssh_user, ssh_port, ssh_key_path FROM drone_config WHERE node_name = ?",
+            (drone_name,)) if cp.db else None
+
+        user = 'root'
+        port = 22
+        key_path = None
+
+        if ssh_cfg:
+            user = ssh_cfg['ssh_user'] or 'root'
+            port = ssh_cfg['ssh_port'] or 22
+            key_path = ssh_cfg['ssh_key_path']
+
+        cmd = [
+            'ssh', '-o', 'ConnectTimeout=10', '-o', 'StrictHostKeyChecking=no',
+            '-o', 'BatchMode=yes',
+        ]
+        if port != 22:
+            cmd.extend(['-p', str(port)])
+        if key_path:
+            cmd.extend(['-i', key_path])
+        cmd.append(f'{user}@{ip}')
+
+        if log_type == 'dmesg':
+            cmd.append(f'dmesg | tail -n {lines}')
+        else:
+            cmd.append(f'tail -n {lines} {log_path} 2>/dev/null || echo "Log file not found"')
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            self.send_json({
+                'drone': drone_name,
+                'log_type': log_type,
+                'lines': lines,
+                'content': result.stdout,
+                'error': result.stderr if result.returncode != 0 else None,
+            })
+        except subprocess.TimeoutExpired:
+            self.send_error_json(504, 'SSH timeout')
+        except Exception as e:
+            self.send_error_json(500, str(e))
+
+    def _handle_control_plane_log(self, params: dict):
+        """Read control plane log file."""
+        lines = int(params.get('lines', ['200'])[0])
+        lines = min(lines, 5000)  # Cap at 5000 lines
+
+        log_file = cfg.LOG_FILE
+        try:
+            if os.path.exists(log_file):
+                with open(log_file, 'r') as f:
+                    all_lines = f.readlines()
+                    content = ''.join(all_lines[-lines:])
+            else:
+                content = f"Log file not found: {log_file}"
+
+            self.send_json({
+                'log_file': log_file,
+                'lines': lines,
+                'content': content,
+            })
+        except Exception as e:
+            self.send_error_json(500, str(e))
+
+    def _handle_drone_escalation(self, cp, drone_name: str):
+        """Get escalation state for a drone."""
+        node = cp.db.get_node_by_name(drone_name) if cp.db else None
+        if not node:
+            self.send_error_json(404, f'Drone not found: {drone_name}')
+            return
+
+        # Get escalation state from database
+        state = cp.db.get_escalation_state(node['id']) if cp.db else {}
+
+        # Get last probe result
+        health = cp.db.get_drone_health(node['id']) if cp.db else {}
+        probe = None
+        try:
+            probe_json = health.get('last_probe_result')
+            if probe_json:
+                probe = json.loads(probe_json) if isinstance(probe_json, str) else probe_json
+        except Exception:
+            pass
+
+        self.send_json({
+            'drone': drone_name,
+            'escalation': state,
+            'health': {
+                'failures': health.get('failures', 0),
+                'grounded_until': health.get('grounded_until'),
+                'last_failure': health.get('last_failure'),
+            },
+            'last_probe': probe,
+            'last_probe_at': health.get('last_probe_at'),
+        })
+
+    def _handle_drone_ping(self, cp, drone_name: str):
+        """Send proof-of-life ping to a drone."""
+        node = cp.db.get_node_by_name(drone_name) if cp.db else None
+        if not node:
+            self.send_error_json(404, f'Drone not found: {drone_name}')
+            return
+
+        if cp.proof_of_life:
+            result = cp.proof_of_life.ping(node['id'])
+            self.send_json(result)
+        else:
+            self.send_error_json(500, 'Proof of life prober not available')
+
+    def _handle_self_healing_status(self, cp):
+        """Get overall self-healing status."""
+        result = {
+            'enabled': cp.self_healing is not None,
+            'drones': {},
+        }
+
+        if cp.self_healing:
+            # Get escalation states
+            escalation_state = cp.self_healing.get_escalation_state()
+            for drone_id, state in escalation_state.items():
+                name = cp.db.get_drone_name(drone_id) if cp.db else drone_id
+                result['drones'][name] = {
+                    'drone_id': drone_id,
+                    **state,
+                }
+
+        # Also get health status for all drones
+        if cp.db:
+            nodes = cp.db.get_all_nodes(include_offline=True)
+            for node in nodes:
+                if node['type'] not in ('drone', 'sweeper'):
+                    continue
+                name = node['name']
+                if name not in result['drones']:
+                    result['drones'][name] = {
+                        'drone_id': node['id'],
+                        'level': 0,
+                    }
+                # Add health info
+                health = cp.db.get_drone_health(node['id'])
+                result['drones'][name]['failures'] = health.get('failures', 0)
+                result['drones'][name]['grounded_until'] = health.get('grounded_until')
+                result['drones'][name]['status'] = node['status']
+
+        self.send_json(result)
 
     def _handle_drone_audit(self, cp, drone_name: str):
         """Audit a drone: compare installed packages against allowlist."""

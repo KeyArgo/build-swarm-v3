@@ -1,4 +1,4 @@
-# Build Swarm v3
+# Gentoo Build Swarm
 
 Distributed Gentoo binary package builder. A unified control plane that manages
 a fleet of build drones to compile and distribute binary packages across a
@@ -6,9 +6,53 @@ Gentoo Linux cluster.
 
 **Zero dependencies** -- pure Python stdlib. Works with Python 3.8+.
 
-## What's New in v3.1
+## Documentation
 
-**v3.1.0** (2026-02-10) -- Resilient scheduling, persistent events, SQL explorer.
+| Document | Description |
+|----------|-------------|
+| [QUICKSTART.md](QUICKSTART.md) | Step-by-step getting started guide |
+| [docs/HANDBOOK.md](docs/HANDBOOK.md) | Complete user handbook |
+| [docs/API.md](docs/API.md) | Full API reference |
+| [docs/IMPLEMENTATION-STATUS.md](docs/IMPLEMENTATION-STATUS.md) | Feature implementation status |
+| [CHANGELOG.md](CHANGELOG.md) | Version history |
+| [GAMEPLAN-v4.md](GAMEPLAN-v4.md) | Architecture design document |
+
+## What's New
+
+### v0.4.0-alpha (2026-02-12) -- Self-Healing & Admin Enhancements
+
+- **Self-Healing Drones**: Autonomous recovery with 4-level escalation ladder
+  - Level 1: Service restart → Level 2: Hard restart → Level 3: Container reboot → Level 4: Admin alert
+  - Safe reboot handling (LXC/QEMU only, bare-metal protected)
+  - Proof-of-life ping/pong with latency tracking
+- **Admin Terminal**: WebSocket SSH bridge for browser-based drone access
+- **Log Viewer**: Centralized access to drone and control plane logs
+- **Heartbeat Visualization**: Animated topology with color-coded health status
+- **Payload Versioning**: Track and deploy drone software versions
+  - Rolling deployments with health checks
+  - Hash verification and drift detection
+- **Access Control**: Protected endpoints require admin authentication
+- **New Endpoints**: `/api/v1/ping`, `/api/v1/escalation`, `/admin/api/payloads/*`
+
+See [CHANGELOG.md](CHANGELOG.md) for full details.
+
+### v0.3.2 (2026-02-12) -- Build Profiles & Portage Snapshots
+
+- **Build Profiles**: Named package sets for distribution or end-user builds
+  - `profile create` / `list` / `show` / `sync` / `edit` / `delete` CLI commands
+  - Distribution mode: maintain a curated world file, auto-rebuild when portage syncs
+  - User mode: point at any machine's world file (local or SSH)
+  - Incremental sync: only queues packages that changed since last sync
+  - `fresh --profile <id>`: profile-aware full rebuild
+- **Portage Snapshots**: Compressed tarballs of the portage tree, kept forever
+  - Automatic snapshots on profile sync, manual via `snapshot create`
+  - Tied to sessions for build reproducibility
+  - `snapshot list` / `snapshot create` CLI commands
+- **Auto-rebuild**: Profiles with `auto_rebuild` automatically queue outdated packages after portage sync
+- **Profile API**: Full REST API for profile CRUD, world updates, sync, and snapshots
+- **Backward compatible**: `fresh` without `--profile` works exactly as before
+
+### v3.1.0 (2026-02-10) -- Resilient scheduling, persistent events, SQL explorer.
 
 - **Stale completion filtering**: Discards false failures from rebalanced packages (root cause of 82% failure rate in v3.0)
 - **Smart package-drone assignment**: Avoids assigning packages to drones that previously failed them
@@ -115,7 +159,7 @@ build-swarmv3 monitor
 |---------|-------------|
 | `build-swarmv3 serve` | Start the control plane HTTP server |
 | `build-swarmv3 status` | Show queue status |
-| `build-swarmv3 fresh` | Queue all @world packages for a fresh build |
+| `build-swarmv3 fresh [--profile ID]` | Queue all @world packages (or profile packages) |
 | `build-swarmv3 queue add <pkgs...>` | Add specific packages to the queue |
 | `build-swarmv3 queue list` | List current queue contents |
 | `build-swarmv3 fleet` | List registered drones |
@@ -127,6 +171,24 @@ build-swarmv3 monitor
 | `build-swarmv3 drone audit [names...]` | Audit drones against spec |
 | `build-swarmv3 drone deploy <ip>` | Deploy drone to a target machine |
 | `build-swarmv3 switch <v2\|v3>` | Switch drones between control planes |
+
+### Build Profiles
+
+| Command | Description |
+|---------|-------------|
+| `build-swarmv3 profile list` | List all build profiles |
+| `build-swarmv3 profile create <id>` | Create a new profile |
+| `build-swarmv3 profile show <id>` | Show profile details and packages |
+| `build-swarmv3 profile sync <id> [--full]` | Resolve world, diff, queue builds |
+| `build-swarmv3 profile edit <id>` | Add/remove packages from a profile |
+| `build-swarmv3 profile delete <id>` | Delete a profile |
+
+### Portage Snapshots
+
+| Command | Description |
+|---------|-------------|
+| `build-swarmv3 snapshot list` | List portage tree snapshots |
+| `build-swarmv3 snapshot create` | Create a manual snapshot |
 
 ### Control Actions
 
@@ -152,6 +214,8 @@ build-swarmv3 monitor
 | `STAGING_PATH` | `/var/cache/binpkgs-v3-staging` | same | Binary package staging area |
 | `BINHOST_PATH` | `/var/cache/binpkgs-v3` | same | Final binary package host path |
 | `V2_SWARM_CONFIG` | auto-detected | auto-detected | Path to v2 swarm.json |
+| `PROFILES_DIR` | `/var/lib/build-swarm-v3/profiles` | `~/.local/share/build-swarm-v3/profiles` | Profile data directory |
+| `PORTAGE_SNAPSHOTS_DIR` | `/var/cache/portage-snapshots` | same | Portage tree snapshot storage |
 
 ## API Endpoints
 
@@ -181,6 +245,14 @@ All non-serve commands talk to these endpoints on the running server:
 | GET | `/api/v1/sql/tables` | Table names and row counts |
 | GET | `/api/v1/sql/schema` | Table schemas |
 | GET | `/api/v1/sql/query?q=SELECT...` | Read-only SQL queries (SELECT only) |
+| GET | `/api/v1/profiles` | List all build profiles |
+| GET | `/api/v1/profiles/<id>` | Profile details with packages |
+| POST | `/api/v1/profiles` | Create a new profile |
+| POST | `/api/v1/profiles/<id>/world` | Update profile world packages |
+| POST | `/api/v1/profile/sync` | Resolve, diff, and queue builds |
+| DELETE | `/api/v1/profiles/<id>` | Delete a profile |
+| GET | `/api/v1/snapshots` | List portage snapshots |
+| POST | `/api/v1/snapshots` | Create a portage snapshot |
 
 ## Project Structure
 

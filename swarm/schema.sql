@@ -11,11 +11,15 @@ CREATE TABLE IF NOT EXISTS nodes (
     ip TEXT,
     tailscale_ip TEXT,
     type TEXT CHECK(type IN ('drone','sweeper')) NOT NULL,
+    drone_type TEXT DEFAULT 'unknown',  -- v4: lxc, qemu, bare-metal, unknown
     cores INTEGER,
     ram_gb REAL,
     status TEXT DEFAULT 'offline',
     paused INTEGER DEFAULT 0,
     last_seen REAL,                 -- unix timestamp for fast comparison
+    last_ping_at REAL,              -- v4: last proof-of-life ping sent
+    last_pong_at REAL,              -- v4: last proof-of-life pong received
+    ping_latency_ms REAL,           -- v4: last ping/pong round-trip time
     capabilities_json TEXT,         -- {arch, auto_reboot, portage_timestamp, ...}
     metrics_json TEXT,              -- {cpu_percent, ram_percent, load_1m, ...}
     current_task TEXT,
@@ -79,7 +83,13 @@ CREATE TABLE IF NOT EXISTS drone_health (
     rebooted INTEGER DEFAULT 0,
     grounded_until REAL,
     upload_failures INTEGER DEFAULT 0,
-    last_upload_failure REAL
+    last_upload_failure REAL,
+    -- v4: Self-healing escalation tracking
+    escalation_level INTEGER DEFAULT 0,      -- current escalation level (0-4)
+    last_escalation_at REAL,                 -- when last escalation action was taken
+    escalation_attempts INTEGER DEFAULT 0,   -- total escalation attempts
+    last_probe_result TEXT,                  -- JSON of last health probe result
+    last_probe_at REAL                       -- when last probe was sent
 );
 
 -- Metrics time-series (ring buffer for charting)
@@ -218,3 +228,85 @@ CREATE TABLE IF NOT EXISTS drone_allowlist (
 );
 CREATE INDEX IF NOT EXISTS idx_allowlist_drone ON drone_allowlist(drone_id);
 CREATE INDEX IF NOT EXISTS idx_allowlist_package ON drone_allowlist(package);
+
+-- Build profiles: named package sets for distribution or user builds
+CREATE TABLE IF NOT EXISTS build_profiles (
+    id TEXT PRIMARY KEY,                    -- slug: 'argo-distro', 'callisto-user'
+    name TEXT NOT NULL,                     -- human label
+    profile_type TEXT NOT NULL              -- 'distribution' or 'user'
+        CHECK(profile_type IN ('distribution', 'user')),
+    world_source TEXT NOT NULL,             -- 'inline', 'local:/path', 'ssh:user@host:/path'
+    world_packages TEXT,                    -- newline-separated resolved package atoms
+    world_hash TEXT,                        -- SHA256 prefix for change detection
+    auto_rebuild INTEGER DEFAULT 0,         -- 1 = queue outdated after portage sync
+    binhost_ip TEXT,                        -- target binhost IP
+    binhost_path TEXT,                      -- target binhost path
+    portage_snapshot_id INTEGER,            -- last snapshot used for resolution
+    metadata_json TEXT,                     -- extensible JSON blob
+    created_at REAL DEFAULT (strftime('%s','now')),
+    updated_at REAL DEFAULT (strftime('%s','now')),
+    last_sync_at REAL
+);
+
+-- Portage snapshots: compressed tarballs of the portage tree, kept forever
+CREATE TABLE IF NOT EXISTS portage_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename TEXT NOT NULL UNIQUE,          -- e.g. 'portage-20260212-034500.tar.zst'
+    timestamp TEXT NOT NULL,                -- portage tree timestamp from metadata/timestamp.chk
+    size_bytes INTEGER,
+    trigger TEXT,                           -- 'pre_sync', 'profile_sync', 'release', 'manual'
+    profile_id TEXT,                        -- which profile triggered it (if applicable)
+    notes TEXT,
+    created_at REAL DEFAULT (strftime('%s','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_snapshots_timestamp ON portage_snapshots(timestamp);
+
+-- v4: Payload versioning - central version registry for all deployable components
+CREATE TABLE IF NOT EXISTS payload_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    payload_type TEXT NOT NULL,           -- 'drone_binary', 'config', 'portage_config', 'init_script'
+    version TEXT NOT NULL,
+    hash TEXT NOT NULL,                   -- SHA256 of payload content
+    content_path TEXT,                    -- Path to payload file (NULL = inline in content_blob)
+    content_blob BLOB,                    -- Small payloads can be stored inline
+    description TEXT,
+    notes TEXT,
+    created_at REAL DEFAULT (strftime('%s','now')),
+    created_by TEXT,
+    UNIQUE(payload_type, version)
+);
+CREATE INDEX IF NOT EXISTS idx_payload_versions_type ON payload_versions(payload_type);
+
+-- v4: Drone payloads - tracks which versions each drone has deployed
+CREATE TABLE IF NOT EXISTS drone_payloads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    drone_id TEXT NOT NULL,
+    payload_type TEXT NOT NULL,           -- same types as payload_versions
+    version TEXT NOT NULL,
+    hash TEXT NOT NULL,                   -- SHA256 at time of deployment (for drift detection)
+    status TEXT DEFAULT 'deployed'
+        CHECK(status IN ('pending', 'deploying', 'deployed', 'failed', 'rollback')),
+    deployed_at REAL,
+    deployed_by TEXT,
+    error_message TEXT,
+    FOREIGN KEY (drone_id) REFERENCES nodes(id),
+    UNIQUE(drone_id, payload_type)
+);
+CREATE INDEX IF NOT EXISTS idx_drone_payloads_drone ON drone_payloads(drone_id);
+CREATE INDEX IF NOT EXISTS idx_drone_payloads_type ON drone_payloads(payload_type);
+
+-- v4: Payload deployment log - history of all deployment attempts
+CREATE TABLE IF NOT EXISTS payload_deploy_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    drone_id TEXT NOT NULL,
+    payload_type TEXT NOT NULL,
+    version TEXT NOT NULL,
+    action TEXT NOT NULL,                 -- 'deploy', 'rollback', 'verify'
+    status TEXT NOT NULL,                 -- 'success', 'failed', 'skipped'
+    duration_ms REAL,
+    error_message TEXT,
+    deployed_at REAL DEFAULT (strftime('%s','now')),
+    deployed_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_payload_deploy_log_drone ON payload_deploy_log(drone_id);
+CREATE INDEX IF NOT EXISTS idx_payload_deploy_log_time ON payload_deploy_log(deployed_at);

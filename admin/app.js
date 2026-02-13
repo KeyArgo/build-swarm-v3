@@ -299,7 +299,7 @@ async function refresh() {
   else if (tab === 'binhost') await refreshBinhost();
   else if (tab === 'queue') await refreshQueue();
   else if (tab === 'history') await refreshHistory();
-  else if (tab === 'topology') await refreshTopology();
+  else if (tab === 'topology') { await refreshTopology(); await refreshSelfHealing(); }
   else if (tab === 'wire') await refreshWire();
   else if (tab === 'events') await refreshEvents();
 }
@@ -1599,10 +1599,14 @@ async function runSQL() {
 
 // ── Topology tab ──
 
+// Heartbeat state - tracks animation timing per drone
+let heartbeatState = {};
+
 async function refreshTopology() {
-  const [status, v2Data] = await Promise.all([
+  const [status, v2Data, escalationData] = await Promise.all([
     v3Get('/status'),
     adminGet('/v2/nodes'),
+    v3Get('/escalation').catch(() => null),  // May not exist yet
   ]);
 
   const container = $('#topology-svg');
@@ -1611,13 +1615,44 @@ async function refreshTopology() {
   const drones = status?.drones ? Object.entries(status.drones) : [];
   const v2Nodes = [...(v2Data?.drones || []), ...(v2Data?.orchestrators || [])];
 
+  // Build escalation map: drone_name -> level
+  const escalation = {};
+  if (escalationData?.drones) {
+    for (const [name, data] of Object.entries(escalationData.drones)) {
+      escalation[name] = data.escalation_level || 0;
+    }
+  }
+
   // Build SVG
   const W = 700, H = 400;
   let svg = `<svg viewBox="0 0 ${W} ${H}" width="${W}" style="max-width:100%">`;
+
+  // Define animation styles and gradients
+  svg += `<defs>
+    <linearGradient id="healthy-gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#06b6d4;stop-opacity:0.8"/>
+      <stop offset="100%" style="stop-color:#22c55e;stop-opacity:0.8"/>
+    </linearGradient>
+    <linearGradient id="warning-gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#f59e0b;stop-opacity:0.8"/>
+      <stop offset="100%" style="stop-color:#ef4444;stop-opacity:0.8"/>
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="2" result="coloredBlur"/>
+      <feMerge><feMergeNode in="coloredBlur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>`;
+
   svg += `<style>
     text { fill: #94a3b8; font-family: 'JetBrains Mono', monospace; font-size: 11px; }
     .node-box { rx: 6; ry: 6; }
     .label { font-size: 9px; fill: #64748b; }
+    @keyframes pulse-healthy { 0%,100% { opacity: 0.6; } 50% { opacity: 1; } }
+    @keyframes pulse-warning { 0%,100% { opacity: 0.4; r: 3; } 50% { opacity: 1; r: 5; } }
+    @keyframes pulse-critical { 0%,100% { opacity: 0.3; r: 4; } 50% { opacity: 1; r: 7; } }
+    .heartbeat-healthy { animation: pulse-healthy 2s ease-in-out infinite; }
+    .heartbeat-warning { animation: pulse-warning 1s ease-in-out infinite; }
+    .heartbeat-critical { animation: pulse-critical 0.5s ease-in-out infinite; }
   </style>`;
 
   // Control plane (center top)
@@ -1638,30 +1673,83 @@ async function refreshTopology() {
   svg += `<line x1="${W/2-20}" y1="117" x2="${W/2+20}" y2="117" stroke="#f59e0b" stroke-width="0.5" stroke-dasharray="4,3" opacity="0.5"/>`;
   svg += `<text x="${W/2}" y="112" text-anchor="middle" class="label" fill="#f59e0b">rsync</text>`;
 
-  // V3 drones
+  // V3 drones with heartbeat visualization
   const droneY = 200;
   const droneCount = drones.length || 1;
   const spacing = Math.min(140, (W - 100) / Math.max(droneCount, 1));
   const startX = (W - (droneCount - 1) * spacing) / 2;
+  const cpX = W / 2, cpY = 60;  // Control plane center
 
   drones.forEach(([id, d], i) => {
     const x = startX + i * spacing;
     const online = d.status === 'online';
-    const color = online ? '#06b6d4' : '#ef4444';
+    const droneName = d.name || id;
+    const escLevel = escalation[droneName] || 0;
+
+    // Color based on escalation level
+    let color = '#06b6d4';  // Healthy cyan
+    let pulseClass = 'heartbeat-healthy';
+    if (!online) {
+      color = '#ef4444';  // Offline red
+      pulseClass = 'heartbeat-critical';
+    } else if (escLevel >= 3) {
+      color = '#dc2626';  // Critical red
+      pulseClass = 'heartbeat-critical';
+    } else if (escLevel >= 2) {
+      color = '#f59e0b';  // Warning amber
+      pulseClass = 'heartbeat-warning';
+    } else if (escLevel >= 1) {
+      color = '#eab308';  // Yellow
+      pulseClass = 'heartbeat-warning';
+    }
+
     const ap = d.assigned_packages || [];
     const bp = d.build_progress || [];
     const shortPkg = pkg => pkg.replace(/^=/, '').replace(/^[a-z]+-[a-z]+\//, m => m.split('/')[0].slice(0,3) + '/');
     const task = ap.length > 0 ? shortPkg(ap[0]) : (d.current_task || '');
     const pct = bp.length > 0 && bp[0].progress_pct != null ? bp[0].progress_pct : null;
-    const boxH = task ? (pct != null ? 56 : 48) : 35;
-    svg += `<line x1="${W/2}" y1="60" x2="${x}" y2="${droneY}" stroke="${color}" stroke-width="0.5" opacity="0.3"/>`;
-    svg += `<rect x="${x-55}" y="${droneY}" width="110" height="${boxH}" class="node-box" fill="#0f172a" stroke="${color}" stroke-width="1"/>`;
-    svg += `<text x="${x}" y="${droneY+15}" text-anchor="middle" fill="${color}" font-weight="500">${d.name || id}</text>`;
+    const boxH = task ? (pct != null ? 62 : 54) : 42;
+
+    // Connection line (path for animation)
+    const pathId = `path-${droneName.replace(/[^a-zA-Z0-9]/g, '')}`;
+    svg += `<path id="${pathId}" d="M${cpX},${cpY} L${x},${droneY}" stroke="${color}" stroke-width="0.5" opacity="0.3" fill="none"/>`;
+
+    // Heartbeat packet traveling along the line (only if online)
+    if (online) {
+      // Animate small circles along the path
+      const animDur = escLevel >= 2 ? '1s' : '2s';  // Faster pulse when escalating
+      svg += `<circle r="3" fill="${color}" filter="url(#glow)" class="${pulseClass}">
+        <animateMotion dur="${animDur}" repeatCount="indefinite">
+          <mpath href="#${pathId}"/>
+        </animateMotion>
+      </circle>`;
+      // Return packet (pong) - slightly delayed
+      svg += `<circle r="2" fill="#22c55e" opacity="0.7">
+        <animateMotion dur="${animDur}" repeatCount="indefinite" begin="0.5s" keyPoints="1;0" keyTimes="0;1" calcMode="linear">
+          <mpath href="#${pathId}"/>
+        </animateMotion>
+      </circle>`;
+    }
+
+    // Drone box
+    svg += `<rect x="${x-55}" y="${droneY}" width="110" height="${boxH}" class="node-box" fill="#0f172a" stroke="${color}" stroke-width="${escLevel > 0 ? 2 : 1}"/>`;
+
+    // Drone name and info
+    svg += `<text x="${x}" y="${droneY+15}" text-anchor="middle" fill="${color}" font-weight="500">${droneName}</text>`;
     svg += `<text x="${x}" y="${droneY+27}" text-anchor="middle" class="label">${d.ip || ''}</text>`;
+
+    // Escalation level indicator
+    if (escLevel > 0) {
+      const escColors = ['', '#eab308', '#f59e0b', '#ef4444', '#dc2626'];
+      const escLabels = ['', 'L1', 'L2', 'L3', 'L4'];
+      svg += `<rect x="${x+35}" y="${droneY+3}" width="16" height="12" rx="2" fill="${escColors[escLevel]}" opacity="0.9"/>`;
+      svg += `<text x="${x+43}" y="${droneY+12}" text-anchor="middle" style="font-size:7px;font-weight:bold" fill="#0f172a">${escLabels[escLevel]}</text>`;
+    }
+
+    // Task and progress
     if (task) svg += `<text x="${x}" y="${droneY+40}" text-anchor="middle" style="font-size:8px" fill="${ap.length > 0 ? '#22c55e' : '#94a3b8'}">${task}</text>`;
     if (pct != null) {
-      // Progress bar
-      const barW = 90, barH = 5, barX = x - barW/2, barY = droneY + 44;
+      const barW = 90, barH = 5, barX = x - barW/2, barY = droneY + 50;
       svg += `<rect x="${barX}" y="${barY}" width="${barW}" height="${barH}" rx="2" fill="rgba(255,255,255,0.1)"/>`;
       svg += `<rect x="${barX}" y="${barY}" width="${Math.max(2, barW * pct / 100)}" height="${barH}" rx="2" fill="#22c55e"/>`;
       svg += `<text x="${x + barW/2 + 4}" y="${barY + 4}" style="font-size:7px" fill="#94a3b8">${pct}%</text>`;
@@ -1671,6 +1759,16 @@ async function refreshTopology() {
   if (drones.length === 0) {
     svg += `<text x="${W/2}" y="${droneY+15}" text-anchor="middle" class="label">No v3 drones registered</text>`;
   }
+
+  // Self-healing legend (bottom left)
+  svg += `<g transform="translate(10, ${H - 70})">`;
+  svg += `<text x="0" y="0" class="label" style="font-size:8px;font-weight:600">SELF-HEALING</text>`;
+  svg += `<circle cx="8" cy="12" r="4" fill="#06b6d4"/><text x="16" y="15" style="font-size:7px">Healthy</text>`;
+  svg += `<circle cx="8" cy="24" r="4" fill="#eab308"/><text x="16" y="27" style="font-size:7px">L1 Service Restart</text>`;
+  svg += `<circle cx="8" cy="36" r="4" fill="#f59e0b"/><text x="16" y="39" style="font-size:7px">L2 Hard Restart</text>`;
+  svg += `<circle cx="8" cy="48" r="4" fill="#ef4444"/><text x="16" y="51" style="font-size:7px">L3 Reboot</text>`;
+  svg += `<circle cx="8" cy="60" r="4" fill="#dc2626" class="heartbeat-critical"/><text x="16" y="63" style="font-size:7px">L4 Admin Alert</text>`;
+  svg += `</g>`;
 
   // V2 nodes
   const v2Y = 310;
@@ -1692,6 +1790,104 @@ async function refreshTopology() {
 
   svg += '</svg>';
   container.innerHTML = svg;
+}
+
+// ── Self-Healing Monitor ──
+
+async function refreshSelfHealing() {
+  // Fetch escalation data from control plane
+  const escalationData = await v3Get('/escalation').catch(() => null);
+  const pingData = await v3Get('/ping').catch(() => null);
+
+  // Update stat cards
+  const statHealthy = $('#stat-sh-healthy .value');
+  const statEscalating = $('#stat-sh-escalating .value');
+  const statCritical = $('#stat-sh-critical .value');
+  const statLatency = $('#stat-sh-avg-latency .value');
+  const statMonitor = $('#stat-sh-monitor .value');
+
+  let healthy = 0, escalating = 0, critical = 0, totalLatency = 0, latencyCount = 0;
+
+  if (escalationData?.drones) {
+    for (const [name, d] of Object.entries(escalationData.drones)) {
+      const level = d.escalation_level || 0;
+      if (level === 0) healthy++;
+      else if (level >= 3) critical++;
+      else escalating++;
+
+      if (d.ping_latency_ms && d.ping_latency_ms > 0) {
+        totalLatency += d.ping_latency_ms;
+        latencyCount++;
+      }
+    }
+  }
+
+  if (statHealthy) statHealthy.textContent = healthy;
+  if (statEscalating) statEscalating.textContent = escalating;
+  if (statCritical) statCritical.textContent = critical;
+  if (statLatency) {
+    const avgLatency = latencyCount > 0 ? Math.round(totalLatency / latencyCount) : 0;
+    statLatency.textContent = avgLatency > 0 ? `${avgLatency}ms` : '-';
+  }
+  if (statMonitor) {
+    const status = escalationData?.monitor_running ? 'Running' : 'Stopped';
+    statMonitor.textContent = status;
+    statMonitor.className = `value ${escalationData?.monitor_running ? 'green' : 'red'}`;
+  }
+
+  // Update self-healing table
+  const tbody = $('#self-healing-tbody');
+  if (!tbody) return;
+
+  if (!escalationData?.drones || Object.keys(escalationData.drones).length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" class="empty-state">No drone data available</td></tr>';
+    return;
+  }
+
+  const escLevelLabels = ['Healthy', 'L1: Service', 'L2: Hard Restart', 'L3: Reboot', 'L4: Admin Alert'];
+  const escLevelColors = ['green', 'amber', 'amber', 'red', 'red'];
+
+  let rows = '';
+  for (const [name, d] of Object.entries(escalationData.drones)) {
+    const level = d.escalation_level || 0;
+    const droneType = d.drone_type || 'unknown';
+    const status = d.status || 'unknown';
+    const lastPing = d.last_ping_at ? new Date(d.last_ping_at).toLocaleTimeString() : '-';
+    const latency = d.ping_latency_ms ? `${d.ping_latency_ms}ms` : '-';
+
+    const statusColor = status === 'online' ? 'green' : 'red';
+    const levelColor = escLevelColors[level] || 'text-muted';
+
+    rows += `<tr>
+      <td class="mono">${name}</td>
+      <td><span class="badge ${droneType === 'lxc' ? '' : droneType === 'qemu' ? 'v2' : ''}">${droneType}</span></td>
+      <td><span class="badge ${statusColor}">${status}</span></td>
+      <td><span class="badge ${levelColor}">${escLevelLabels[level] || `L${level}`}</span></td>
+      <td>${lastPing}</td>
+      <td class="mono">${latency}</td>
+      <td>
+        <button class="btn" style="font-size:0.65rem;padding:0.2rem 0.4rem" onclick="pingDrone('${name}')">Ping</button>
+        ${level > 0 ? `<button class="btn" style="font-size:0.65rem;padding:0.2rem 0.4rem;margin-left:0.25rem" onclick="resetEscalation('${name}')">Reset</button>` : ''}
+      </td>
+    </tr>`;
+  }
+
+  tbody.innerHTML = rows;
+}
+
+async function pingDrone(name) {
+  const result = await v3Post(`/nodes/${name}/ping`);
+  if (result?.ok) {
+    // Refresh after a moment to show updated latency
+    setTimeout(() => refreshSelfHealing(), 500);
+  }
+}
+
+async function resetEscalation(name) {
+  const result = await v3Post(`/nodes/${name}/reset-escalation`);
+  if (result?.ok) {
+    refreshSelfHealing();
+  }
 }
 
 // ── System info ──

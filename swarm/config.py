@@ -65,6 +65,12 @@ ADMIN_STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 RELEASES_BASE_PATH = os.environ.get('RELEASES_BASE_PATH', '/var/cache/binpkgs-releases')
 BINHOST_SYMLINK_PATH = os.environ.get('BINHOST_SYMLINK_PATH', '/var/cache/binpkgs')
 
+# Build profiles
+PROFILES_DIR = os.environ.get('PROFILES_DIR', os.path.join(_DATA_DIR, 'profiles'))
+
+# Portage snapshots (kept forever, never pruned)
+PORTAGE_SNAPSHOTS_DIR = os.environ.get('PORTAGE_SNAPSHOTS_DIR', '/var/cache/portage-snapshots')
+
 # Binhost configuration (primary = seasonal, secondary = always-on)
 BINHOST_PRIMARY_IP = os.environ.get('BINHOST_PRIMARY_IP', '10.0.0.204')
 BINHOST_SECONDARY_IP = os.environ.get('BINHOST_SECONDARY_IP', '100.114.16.118')

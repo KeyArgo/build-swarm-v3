@@ -98,6 +98,20 @@ def api_post(path: str, data: dict = None) -> dict:
         _connection_error(e)
 
 
+def api_delete(path: str) -> dict:
+    """Send a DELETE request to the control plane API."""
+    url = f'{_resolve_url()}{path}'
+    try:
+        req = urllib.request.Request(url, method='DELETE')
+        req.add_header('Accept', 'application/json')
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.URLError as e:
+        _connection_error(e)
+    except Exception as e:
+        _connection_error(e)
+
+
 def _resolve_admin_url():
     """Resolve admin dashboard URL (port 8093)."""
     cp_url = _resolve_url()
@@ -343,6 +357,28 @@ def cmd_status(args):
 
 def cmd_fresh(args):
     """Create a fresh session by reading @world and queuing all packages."""
+    # If --profile is specified, delegate to profile sync (full=True)
+    profile_id = getattr(args, 'profile', None)
+    if profile_id:
+        print_header(f'Fresh Build Session (Profile: {profile_id})')
+        print(f'  {C.DIM}Syncing profile via control plane (full rebuild)...{C.RESET}')
+        print()
+        resp = api_post('/api/v1/profile/sync', {
+            'profile_id': profile_id,
+            'full': True,
+        })
+        if 'error' in resp:
+            print(f'{C.RED}Error:{C.RESET} {resp["error"]}')
+            sys.exit(1)
+        print(f'  {C.BGREEN}Resolved:{C.RESET} {resp.get("resolved", 0)} packages')
+        print(f'  {C.BGREEN}Queued:{C.RESET} {resp.get("queued", 0)} packages')
+        if resp.get('session_id'):
+            print(f'  {C.DIM}Session: {resp["session_id"]}{C.RESET}')
+        if resp.get('snapshot_id'):
+            print(f'  {C.DIM}Portage snapshot: #{resp["snapshot_id"]}{C.RESET}')
+        print()
+        return
+
     print_header('Fresh Build Session')
     print(f'  {C.DIM}Running: emerge --pretend --emptytree @world ...{C.RESET}')
     print(f'  {C.DIM}(this may take a moment){C.RESET}')
@@ -409,6 +445,286 @@ def cmd_fresh(args):
         print(f'  {C.DIM}Session: {session_id}{C.RESET}')
     print()
 
+
+# ── Profile Commands ──────────────────────────────────────────────────────────
+
+def cmd_profile(args):
+    """Dispatch profile subcommands."""
+    sub = getattr(args, 'profile_command', None)
+    if sub == 'list':
+        cmd_profile_list(args)
+    elif sub == 'create':
+        cmd_profile_create(args)
+    elif sub == 'show':
+        cmd_profile_show(args)
+    elif sub == 'sync':
+        cmd_profile_sync(args)
+    elif sub == 'edit':
+        cmd_profile_edit(args)
+    elif sub == 'delete':
+        cmd_profile_delete(args)
+    else:
+        print(f'{C.RED}Error:{C.RESET} Specify a profile sub-command: '
+              f'list, create, show, sync, edit, delete')
+        sys.exit(1)
+
+
+def cmd_profile_list(args):
+    """List all build profiles."""
+    print_header('Build Profiles')
+    resp = api_get('/api/v1/profiles')
+    profiles = resp.get('profiles', [])
+
+    if not profiles:
+        print(f'  {C.DIM}No profiles configured.{C.RESET}')
+        print(f'  {C.DIM}Create one: build-swarmv3 profile create <id> --name "..."{C.RESET}')
+        print()
+        return
+
+    for p in profiles:
+        auto = f' {C.GREEN}[auto-rebuild]{C.RESET}' if p.get('auto_rebuild') else ''
+        ptype = p.get('profile_type', '?')
+        counts = p.get('queue_counts', {})
+        needed = counts.get('needed', 0)
+        delegated = counts.get('delegated', 0)
+        received = counts.get('received', 0)
+        blocked = counts.get('blocked', 0)
+
+        print(f'  {C.BOLD}{p["id"]}{C.RESET} — {p["name"]}')
+        print(f'    {C.DIM}Type: {ptype} | Source: {p.get("world_source", "?")}{auto}{C.RESET}')
+        if needed + delegated + received + blocked > 0:
+            print(f'    {C.DIM}Queue: {needed} needed, {delegated} building, '
+                  f'{received} done, {blocked} blocked{C.RESET}')
+        last_sync = p.get('last_sync_at')
+        if last_sync:
+            print(f'    {C.DIM}Last sync: {fmt_timestamp(last_sync)}{C.RESET}')
+        print()
+
+
+def cmd_profile_create(args):
+    """Create a new build profile."""
+    data = {
+        'id': args.id,
+        'name': args.name,
+        'profile_type': args.type,
+        'world_source': args.world_source or 'inline',
+        'auto_rebuild': args.auto_rebuild,
+        'binhost_ip': args.binhost_ip,
+    }
+
+    # If a world file is provided, read it and send as initial packages
+    if args.world_file:
+        try:
+            with open(args.world_file) as f:
+                packages = [line.strip() for line in f
+                            if line.strip() and not line.startswith('#')]
+            data['initial_packages'] = packages
+            if not args.world_source:
+                data['world_source'] = 'inline'
+            print(f'  {C.DIM}Read {len(packages)} packages from {args.world_file}{C.RESET}')
+        except Exception as e:
+            print(f'{C.RED}Error:{C.RESET} Cannot read world file: {e}')
+            sys.exit(1)
+
+    resp = api_post('/api/v1/profiles', data)
+    if 'error' in resp:
+        print(f'{C.RED}Error:{C.RESET} {resp["error"]}')
+        sys.exit(1)
+
+    print(f'{C.BGREEN}Created profile:{C.RESET} {resp["id"]} ({resp["name"]})')
+    print(f'  {C.DIM}Type: {resp.get("profile_type")} | '
+          f'Source: {resp.get("world_source")}{C.RESET}')
+
+
+def cmd_profile_show(args):
+    """Show details of a profile."""
+    resp = api_get(f'/api/v1/profiles/{args.id}')
+    if 'error' in resp:
+        print(f'{C.RED}Error:{C.RESET} {resp["error"]}')
+        sys.exit(1)
+
+    print_header(f'Profile: {resp["id"]}')
+    print(f'  {C.BOLD}Name:{C.RESET}         {resp["name"]}')
+    print(f'  {C.BOLD}Type:{C.RESET}         {resp.get("profile_type")}')
+    print(f'  {C.BOLD}Source:{C.RESET}       {resp.get("world_source")}')
+    print(f'  {C.BOLD}Auto-rebuild:{C.RESET} {"yes" if resp.get("auto_rebuild") else "no"}')
+    if resp.get('binhost_ip'):
+        print(f'  {C.BOLD}Binhost:{C.RESET}      {resp.get("binhost_ip")}')
+    if resp.get('world_hash'):
+        print(f'  {C.BOLD}World hash:{C.RESET}   {resp["world_hash"]}')
+    if resp.get('last_sync_at'):
+        print(f'  {C.BOLD}Last sync:{C.RESET}    {fmt_timestamp(resp["last_sync_at"])}')
+
+    counts = resp.get('queue_counts', {})
+    needed = counts.get('needed', 0)
+    delegated = counts.get('delegated', 0)
+    received = counts.get('received', 0)
+    blocked = counts.get('blocked', 0)
+    if needed + delegated + received + blocked > 0:
+        print()
+        print(f'  {C.BOLD}Queue:{C.RESET} {needed} needed, {delegated} building, '
+              f'{received} done, {blocked} blocked')
+
+    packages = resp.get('packages', [])
+    if packages:
+        print()
+        print(f'  {C.BOLD}Packages ({len(packages)}):{C.RESET}')
+        for pkg in packages[:30]:
+            print(f'    {pkg}')
+        if len(packages) > 30:
+            print(f'    {C.DIM}... and {len(packages) - 30} more{C.RESET}')
+    print()
+
+
+def cmd_profile_sync(args):
+    """Sync a profile: resolve world, diff, queue builds."""
+    print_header(f'Profile Sync: {args.id}')
+    full = getattr(args, 'full', False)
+    mode = 'full rebuild' if full else 'incremental'
+    print(f'  {C.DIM}Mode: {mode}{C.RESET}')
+    print(f'  {C.DIM}Resolving package tree (this may take a moment)...{C.RESET}')
+    print()
+
+    resp = api_post('/api/v1/profile/sync', {
+        'profile_id': args.id,
+        'full': full,
+    })
+
+    if 'error' in resp:
+        print(f'{C.RED}Error:{C.RESET} {resp["error"]}')
+        sys.exit(1)
+
+    print(f'  {C.BGREEN}Resolved:{C.RESET} {resp.get("resolved", 0)} packages in tree')
+    queued = resp.get('queued', 0)
+    if queued > 0:
+        print(f'  {C.BGREEN}Queued:{C.RESET}   {queued} packages for building')
+    else:
+        print(f'  {C.GREEN}All packages up to date{C.RESET}')
+    if resp.get('session_id'):
+        print(f'  {C.DIM}Session: {resp["session_id"]}{C.RESET}')
+    if resp.get('snapshot_id'):
+        print(f'  {C.DIM}Portage snapshot: #{resp["snapshot_id"]}{C.RESET}')
+    print()
+
+
+def cmd_profile_edit(args):
+    """Edit a profile's world packages."""
+    profile_id = args.id
+
+    # Read current packages
+    resp = api_get(f'/api/v1/profiles/{profile_id}')
+    if 'error' in resp:
+        print(f'{C.RED}Error:{C.RESET} {resp["error"]}')
+        sys.exit(1)
+
+    packages = set(resp.get('packages', []))
+    changes = False
+
+    # Replace from file
+    if args.world_file:
+        try:
+            with open(args.world_file) as f:
+                packages = set(line.strip() for line in f
+                               if line.strip() and not line.startswith('#'))
+            changes = True
+            print(f'  {C.DIM}Loaded {len(packages)} packages from {args.world_file}{C.RESET}')
+        except Exception as e:
+            print(f'{C.RED}Error:{C.RESET} Cannot read file: {e}')
+            sys.exit(1)
+
+    # Add packages
+    add_pkgs = getattr(args, 'add', None) or []
+    for pkg in add_pkgs:
+        packages.add(pkg)
+        changes = True
+
+    # Remove packages
+    remove_pkgs = getattr(args, 'remove', None) or []
+    for pkg in remove_pkgs:
+        packages.discard(pkg)
+        changes = True
+
+    if not changes:
+        print(f'{C.YELLOW}No changes specified.{C.RESET} '
+              f'Use --world-file, --add, or --remove.')
+        sys.exit(1)
+
+    # Update the profile world via the API
+    update_resp = api_post(f'/api/v1/profiles/{profile_id}/world', {
+        'packages': sorted(packages),
+    })
+    if 'error' in update_resp:
+        print(f'{C.RED}Error:{C.RESET} {update_resp["error"]}')
+        sys.exit(1)
+
+    print(f'  {C.BGREEN}Updated:{C.RESET} {update_resp.get("package_count", len(packages))} '
+          f'packages in profile {profile_id}')
+    print(f'  {C.DIM}Run "build-swarmv3 profile sync {profile_id}" to queue builds.{C.RESET}')
+    print()
+
+
+def cmd_profile_delete(args):
+    """Delete a build profile."""
+    profile_id = args.id
+    resp = api_delete(f'/api/v1/profiles/{profile_id}')
+    if 'error' in resp:
+        print(f'{C.RED}Error:{C.RESET} {resp["error"]}')
+        sys.exit(1)
+    print(f'{C.BGREEN}Deleted:{C.RESET} profile {profile_id}')
+
+
+# ── Snapshot Commands ─────────────────────────────────────────────────────────
+
+def cmd_snapshot(args):
+    """Dispatch snapshot subcommands."""
+    sub = getattr(args, 'snapshot_command', None)
+    if sub == 'list':
+        cmd_snapshot_list(args)
+    elif sub == 'create':
+        cmd_snapshot_create(args)
+    else:
+        print(f'{C.RED}Error:{C.RESET} Specify a snapshot sub-command: list, create')
+        sys.exit(1)
+
+
+def cmd_snapshot_list(args):
+    """List portage snapshots."""
+    print_header('Portage Snapshots')
+    resp = api_get('/api/v1/snapshots')
+    snapshots = resp.get('snapshots', [])
+
+    if not snapshots:
+        print(f'  {C.DIM}No snapshots recorded.{C.RESET}')
+        print()
+        return
+
+    for s in snapshots:
+        size_mb = (s.get('size_bytes') or 0) // 1048576
+        trigger = s.get('trigger', '?')
+        print(f'  {C.BOLD}#{s["id"]}{C.RESET} {s["filename"]}')
+        print(f'    {C.DIM}Tree: {s["timestamp"]} | {size_mb}MB | '
+              f'Trigger: {trigger}{C.RESET}')
+        if s.get('profile_id'):
+            print(f'    {C.DIM}Profile: {s["profile_id"]}{C.RESET}')
+    print()
+
+
+def cmd_snapshot_create(args):
+    """Create a portage snapshot manually."""
+    print(f'  {C.DIM}Creating portage tree snapshot...{C.RESET}')
+    resp = api_post('/api/v1/snapshots', {
+        'trigger': 'manual',
+        'notes': getattr(args, 'notes', None),
+    })
+    if 'error' in resp:
+        print(f'{C.RED}Error:{C.RESET} {resp["error"]}')
+        sys.exit(1)
+    size_mb = (resp.get('size_bytes') or 0) // 1048576
+    print(f'  {C.BGREEN}Created:{C.RESET} {resp["filename"]} ({size_mb}MB)')
+    print(f'  {C.DIM}Snapshot ID: #{resp["snapshot_id"]}{C.RESET}')
+
+
+# ── Queue Commands ────────────────────────────────────────────────────────────
 
 def cmd_queue_add(args):
     """Add packages to the build queue."""
@@ -2088,6 +2404,7 @@ def build_parser() -> argparse.ArgumentParser:
   build-swarmv3 serve                   Start the control plane server
   build-swarmv3 status                  Show current queue status
   build-swarmv3 fresh                   Queue all @world packages
+  build-swarmv3 fresh --profile distro  Queue profile packages (full rebuild)
   build-swarmv3 queue add cat/pkg-1.0   Add packages to queue
   build-swarmv3 control pause           Pause the build queue
   build-swarmv3 monitor                 Live status display
@@ -2095,10 +2412,22 @@ def build_parser() -> argparse.ArgumentParser:
   build-swarmv3 drone deploy 10.0.0.x   Deploy a drone to a target machine
   build-swarmv3 switch v3               Switch all drones to v3
 
+Profiles & Snapshots:
+  build-swarmv3 profile list            List build profiles
+  build-swarmv3 profile create <id>     Create a new profile
+  build-swarmv3 profile sync <id>       Incremental sync (queue changed pkgs)
+  build-swarmv3 profile sync <id> --full  Full rebuild (queue all pkgs)
+  build-swarmv3 profile show <id>       Show profile details
+  build-swarmv3 profile edit <id>       Add/remove packages from profile
+  build-swarmv3 snapshot list           List portage tree snapshots
+  build-swarmv3 snapshot create         Create a manual snapshot
+
 Environment:
   SWARMV3_URL          Server URL (default: http://localhost:8100)
   CONTROL_PLANE_PORT   Port for serve command (default: 8100)
-  SWARM_DB_PATH        Database path for serve command{C.RESET}'''
+  SWARM_DB_PATH        Database path for serve command
+  PROFILES_DIR         Profile data directory
+  PORTAGE_SNAPSHOTS_DIR  Snapshot storage (default: /var/cache/portage-snapshots){C.RESET}'''
     )
 
     parser.add_argument('--no-color', action='store_true',
@@ -2117,7 +2446,9 @@ Environment:
     sub.add_parser('status', help='Show queue status')
 
     # fresh
-    sub.add_parser('fresh', help='Create a fresh session from @world')
+    p_fresh = sub.add_parser('fresh', help='Create a fresh session from @world')
+    p_fresh.add_argument('--profile', type=str, default=None,
+                         help='Use a build profile instead of local @world')
 
     # queue (subcommands)
     p_queue = sub.add_parser('queue', help='Manage the build queue')
@@ -2285,6 +2616,58 @@ Environment:
 
     release_sub.add_parser('migrate', help='One-time migration to release-based layout')
 
+    # profile (subcommands)
+    p_profile = sub.add_parser('profile', help='Manage build profiles')
+    profile_sub = p_profile.add_subparsers(dest='profile_command',
+                                           help='Profile sub-command')
+
+    profile_sub.add_parser('list', help='List all profiles')
+
+    p_pcreate = profile_sub.add_parser('create', help='Create a new profile')
+    p_pcreate.add_argument('id', help='Profile ID (slug, e.g. "argo-distro")')
+    p_pcreate.add_argument('--name', required=True, help='Human-readable name')
+    p_pcreate.add_argument('--type', default='distribution',
+                           choices=['distribution', 'user'],
+                           help='Profile type (default: distribution)')
+    p_pcreate.add_argument('--world-source', default=None,
+                           help='World source: inline, local:/path, ssh:user@host:/path')
+    p_pcreate.add_argument('--world-file', default=None,
+                           help='Import initial world from a local file')
+    p_pcreate.add_argument('--auto-rebuild', action='store_true',
+                           help='Auto-rebuild when portage tree changes')
+    p_pcreate.add_argument('--binhost-ip', default=None,
+                           help='Target binhost IP address')
+
+    p_pshow = profile_sub.add_parser('show', help='Show profile details')
+    p_pshow.add_argument('id', help='Profile ID')
+
+    p_psync = profile_sub.add_parser('sync', help='Sync profile: resolve and queue')
+    p_psync.add_argument('id', help='Profile ID')
+    p_psync.add_argument('--full', action='store_true',
+                         help='Full rebuild (queue all packages, not just changed)')
+
+    p_pedit = profile_sub.add_parser('edit', help='Edit profile world packages')
+    p_pedit.add_argument('id', help='Profile ID')
+    p_pedit.add_argument('--world-file', default=None,
+                         help='Replace world from file')
+    p_pedit.add_argument('--add', nargs='+', default=None,
+                         help='Add packages to world')
+    p_pedit.add_argument('--remove', nargs='+', default=None,
+                         help='Remove packages from world')
+
+    p_pdel = profile_sub.add_parser('delete', help='Delete a profile')
+    p_pdel.add_argument('id', help='Profile ID')
+
+    # snapshot (subcommands)
+    p_snap = sub.add_parser('snapshot', help='Manage portage tree snapshots')
+    snap_sub = p_snap.add_subparsers(dest='snapshot_command',
+                                     help='Snapshot sub-command')
+
+    snap_sub.add_parser('list', help='List portage snapshots')
+
+    p_screate = snap_sub.add_parser('create', help='Create a manual snapshot')
+    p_screate.add_argument('--notes', default=None, help='Optional notes')
+
     # switch
     p_switch = sub.add_parser('switch',
                               help='Switch drones between v2 and v3 control planes')
@@ -2336,6 +2719,10 @@ def main():
         cmd_release(args)
     elif args.command == 'drone':
         cmd_drone(args)
+    elif args.command == 'profile':
+        cmd_profile(args)
+    elif args.command == 'snapshot':
+        cmd_snapshot(args)
     elif args.command in commands:
         commands[args.command](args)
     else:

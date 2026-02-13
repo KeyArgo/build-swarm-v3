@@ -23,6 +23,7 @@ from .db import SwarmDB
 from .events import add_event, get_events_since, get_events_db, init_events, prune_old_events
 from .health import DroneHealthMonitor
 from .scheduler import Scheduler
+from .self_healing import SelfHealingMonitor, ProofOfLifeProber
 
 log = logging.getLogger('swarm-v3')
 
@@ -31,6 +32,8 @@ db: SwarmDB = None
 health_monitor: DroneHealthMonitor = None
 scheduler: Scheduler = None
 release_mgr = None  # ReleaseManager, initialized in start()
+self_healing: SelfHealingMonitor = None  # v4: Self-healing monitor
+proof_of_life: ProofOfLifeProber = None  # v4: Ping/pong prober
 
 
 def get_self_ip() -> str:
@@ -162,6 +165,24 @@ class V3Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip('/')
         params = parse_qs(parsed.query)
+
+        # v4: Access control — admin-only GET endpoints require X-Admin-Key header
+        ADMIN_ONLY_GET = {
+            '/api/v1/sql/query',       # Raw SQL queries - dangerous!
+            '/api/v1/sql/tables',      # Schema info
+            '/api/v1/sql/schema',      # Schema details
+            '/api/v1/drone-health',    # Includes escalation details
+            '/api/v1/provision/bootstrap',  # Bootstrap script (could expose secrets)
+        }
+
+        if path in ADMIN_ONLY_GET:
+            admin_key = self.headers.get('X-Admin-Key', '')
+            if admin_key != cfg.ADMIN_KEY:
+                self.send_json({
+                    'error': 'Admin authentication required',
+                    'hint': 'Use admin dashboard for this endpoint'
+                }, 401)
+                return
 
         # ── Health Check ──
         if path == '/api/v1/health':
@@ -493,8 +514,59 @@ class V3Handler(BaseHTTPRequestHandler):
                     'last_failure': h.get('last_failure'),
                     'last_probe': probe,
                     'last_probe_at': h.get('last_probe_at'),
+                    # v4: Escalation state
+                    'escalation_level': h.get('escalation_level', 0),
+                    'last_escalation_at': h.get('last_escalation_at'),
+                    'escalation_attempts': h.get('escalation_attempts', 0),
                 })
             self.send_json({'drones': result})
+
+        # ── Ping/Pong Proof of Life (v4) ──
+        elif path == '/api/v1/ping':
+            drone_id = params.get('id', [None])[0]
+            drone_name = params.get('name', [None])[0]
+
+            if not drone_id and not drone_name:
+                self.send_json({'error': 'id or name required'}, 400)
+                return
+
+            # Resolve name to ID if needed
+            if drone_name and not drone_id:
+                drone_id = db.resolve_drone_id(drone_name)
+
+            if not drone_id:
+                self.send_json({'error': 'drone not found'}, 404)
+                return
+
+            if proof_of_life:
+                result = proof_of_life.ping(drone_id)
+                self.send_json(result)
+            else:
+                self.send_json({'error': 'proof of life prober not initialized'}, 500)
+
+        # ── Ping All Drones (v4) ──
+        elif path == '/api/v1/ping/all':
+            if proof_of_life:
+                results = proof_of_life.ping_all()
+                self.send_json({'drones': results})
+            else:
+                self.send_json({'error': 'proof of life prober not initialized'}, 500)
+
+        # ── Escalation Status (v4) ──
+        elif path == '/api/v1/escalation':
+            if self_healing:
+                state = self_healing.get_escalation_state()
+                # Enrich with drone names
+                result = {}
+                for drone_id, data in state.items():
+                    name = db.get_drone_name(drone_id)
+                    result[name] = {
+                        'drone_id': drone_id,
+                        **data,
+                    }
+                self.send_json({'drones': result})
+            else:
+                self.send_json({'error': 'self healing monitor not initialized'}, 500)
 
         # ── Binhost Stats (v3.1) ──
         elif path == '/api/v1/binhost-stats':
@@ -643,6 +715,30 @@ class V3Handler(BaseHTTPRequestHandler):
                 })
             self.send_json(result)
 
+        # ── Build Profiles (GET) ──
+        elif path == '/api/v1/profiles':
+            profiles = db.get_all_profiles()
+            for p in profiles:
+                counts = db.get_queue_counts(profile_id=p['id'])
+                p['queue_counts'] = counts
+            self.send_json({'profiles': profiles})
+
+        elif path.startswith('/api/v1/profiles/'):
+            profile_id = path.split('/')[4]
+            profile = db.get_profile(profile_id)
+            if not profile:
+                self.send_json({'error': f'Profile not found: {profile_id}'}, 404)
+                return
+            profile['packages'] = db.get_profile_packages(profile_id)
+            profile['queue_counts'] = db.get_queue_counts(profile_id=profile_id)
+            self.send_json(profile)
+
+        # ── Portage Snapshots (GET) ──
+        elif path == '/api/v1/snapshots':
+            limit = int(params.get('limit', ['50'])[0])
+            snapshots = db.get_snapshots(limit=min(limit, 200))
+            self.send_json({'snapshots': snapshots})
+
         else:
             self.send_json({'error': 'Not found'}, 404)
 
@@ -665,6 +761,26 @@ class V3Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip('/')
         data = self.read_body()
+
+        # v4: Access control — admin-only endpoints require X-Admin-Key header
+        ADMIN_ONLY_ENDPOINTS = {
+            '/api/v1/queue',           # Queue packages for build
+            '/api/v1/control',         # Start/stop/reset session
+            '/api/v1/provision/drone', # Provision new drone
+        }
+        ADMIN_ONLY_PREFIXES = (
+            '/api/v1/nodes/',          # Pause/unpause drone actions
+            '/api/v1/profiles/',       # Profile management (POST)
+        )
+
+        if path in ADMIN_ONLY_ENDPOINTS or any(path.startswith(p) for p in ADMIN_ONLY_PREFIXES):
+            admin_key = self.headers.get('X-Admin-Key', '')
+            if admin_key != cfg.ADMIN_KEY:
+                self.send_json({
+                    'error': 'Admin authentication required',
+                    'hint': 'This endpoint requires X-Admin-Key header on public port. Use admin dashboard instead.'
+                }, 401)
+                return
 
         # ── Node Registration (was Gateway /register) ──
         if path == '/api/v1/register':
@@ -873,6 +989,116 @@ class V3Handler(BaseHTTPRequestHandler):
             else:
                 self.send_json({'error': f'Node not found: {target}'}, 404)
 
+        # ── Reset Escalation (v4) ──
+        elif path.startswith('/api/v1/nodes/') and path.endswith('/reset-escalation'):
+            target = path.split('/')[4]
+            node = db.get_node(target) or db.get_node_by_name(target)
+            if node:
+                if self_healing:
+                    self_healing.reset_escalation(node['id'])
+                db.reset_escalation_state(node['id'])
+                add_event('control', f"{node['name']} escalation reset",
+                          {'drone': node['name'], 'action': 'reset_escalation'})
+                self.send_json({'status': 'reset', 'name': node['name']})
+            else:
+                self.send_json({'error': f'Node not found: {target}'}, 404)
+
+        # ── Manual Ping (v4) ──
+        elif path.startswith('/api/v1/nodes/') and path.endswith('/ping'):
+            target = path.split('/')[4]
+            node = db.get_node(target) or db.get_node_by_name(target)
+            if node:
+                if proof_of_life:
+                    result = proof_of_life.ping(node['id'])
+                    self.send_json(result)
+                else:
+                    self.send_json({'error': 'proof of life prober not initialized'}, 500)
+            else:
+                self.send_json({'error': f'Node not found: {target}'}, 404)
+
+        # ── Set Drone Type (v4) ──
+        elif path.startswith('/api/v1/nodes/') and path.endswith('/set-type'):
+            target = path.split('/')[4]
+            node = db.get_node(target) or db.get_node_by_name(target)
+            drone_type = data.get('type')
+            if not node:
+                self.send_json({'error': f'Node not found: {target}'}, 404)
+            elif drone_type not in ('lxc', 'qemu', 'bare-metal', 'unknown'):
+                self.send_json({'error': 'Invalid type. Must be: lxc, qemu, bare-metal, unknown'}, 400)
+            else:
+                db.set_drone_type(node['id'], drone_type)
+                add_event('control', f"{node['name']} drone type set to {drone_type}",
+                          {'drone': node['name'], 'drone_type': drone_type})
+                self.send_json({'status': 'ok', 'name': node['name'], 'drone_type': drone_type})
+
+        # ── Build Profiles (POST) ──
+        elif path == '/api/v1/profiles':
+            profile_id = data.get('id')
+            name = data.get('name')
+            profile_type = data.get('profile_type', 'distribution')
+            world_source = data.get('world_source', 'inline')
+            if not profile_id or not name:
+                self.send_json({'error': 'Missing id or name'}, 400)
+                return
+            try:
+                profile = db.create_profile(
+                    profile_id=profile_id, name=name,
+                    profile_type=profile_type, world_source=world_source,
+                    auto_rebuild=data.get('auto_rebuild', False),
+                    binhost_ip=data.get('binhost_ip'),
+                    binhost_path=data.get('binhost_path'),
+                    metadata=data.get('metadata'))
+                # If initial packages provided, store them
+                initial = data.get('initial_packages', [])
+                if initial:
+                    db.update_profile_world(profile_id, initial)
+                    profile = db.get_profile(profile_id)
+                log.info(f"Created profile: {profile_id} ({name})")
+                add_event('profile', f"Profile created: {name}",
+                          {'profile_id': profile_id, 'type': profile_type})
+                self.send_json(profile, 201)
+            except Exception as e:
+                self.send_json({'error': str(e)}, 409)
+
+        elif path.startswith('/api/v1/profiles/') and path.endswith('/world'):
+            profile_id = path.split('/')[4]
+            profile = db.get_profile(profile_id)
+            if not profile:
+                self.send_json({'error': f'Profile not found: {profile_id}'}, 404)
+                return
+            packages = data.get('packages', [])
+            if not packages:
+                self.send_json({'error': 'No packages provided'}, 400)
+                return
+            result = db.update_profile_world(profile_id, packages)
+            log.info(f"Updated profile world: {profile_id} ({result['package_count']} packages)")
+            self.send_json({'status': 'ok', **result})
+
+        elif path == '/api/v1/profile/sync':
+            profile_id = data.get('profile_id')
+            full = data.get('full', False)
+            if not profile_id:
+                self.send_json({'error': 'Missing profile_id'}, 400)
+                return
+            profile = db.get_profile(profile_id)
+            if not profile:
+                self.send_json({'error': f'Profile not found: {profile_id}'}, 404)
+                return
+            result = _sync_profile(profile, full=full)
+            self.send_json(result)
+
+        # ── Portage Snapshots (POST) ──
+        elif path == '/api/v1/snapshots':
+            trigger = data.get('trigger', 'manual')
+            profile_id = data.get('profile_id')
+            notes = data.get('notes')
+            result = _create_portage_snapshot(
+                trigger=trigger, profile_id=profile_id, notes=notes)
+            if 'error' in result:
+                self.send_json(result, 500)
+            else:
+                self.send_json(result, 201)
+
         else:
             self.send_json({'error': 'Not found'}, 404)
 
@@ -985,7 +1211,17 @@ class V3Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip('/')
 
-        if path.startswith('/api/v1/nodes/'):
+        if path.startswith('/api/v1/profiles/'):
+            profile_id = path.split('/')[4]
+            if db.delete_profile(profile_id):
+                log.info(f"Deleted profile: {profile_id}")
+                add_event('profile', f"Profile deleted: {profile_id}",
+                          {'profile_id': profile_id})
+                self.send_json({'status': 'deleted', 'id': profile_id})
+            else:
+                self.send_json({'error': f'Profile not found: {profile_id}'}, 404)
+
+        elif path.startswith('/api/v1/nodes/'):
             node_id = path.split('/')[-1]
             if db.remove_node(node_id):
                 self.send_json({'status': 'deleted', 'id': node_id})
@@ -1122,6 +1358,271 @@ def _reclaim_stale_builds():
                       f"(assigned to {owner_name}) — likely a dependency")
 
 
+# ── Build Profiles: Sync Engine ──────────────────────────────────
+
+def _create_portage_snapshot(trigger: str = 'manual', profile_id: str = None,
+                             notes: str = None) -> dict:
+    """Create a portage tree snapshot (compressed tarball). Returns snapshot info."""
+    import datetime
+    snap_dir = cfg.PORTAGE_SNAPSHOTS_DIR
+    portage_dir = '/var/db/repos/gentoo'
+
+    # Read portage tree timestamp
+    ts_file = os.path.join(portage_dir, 'metadata', 'timestamp.chk')
+    try:
+        with open(ts_file) as f:
+            portage_ts = f.read().strip()
+    except Exception:
+        portage_ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    now = datetime.datetime.now()
+    filename = f"portage-{now.strftime('%Y%m%d-%H%M%S')}.tar.zst"
+    filepath = os.path.join(snap_dir, filename)
+
+    try:
+        os.makedirs(snap_dir, exist_ok=True)
+        result = subprocess.run(
+            ['tar', '-cf', filepath, '--zstd', '-C', '/var/db/repos', 'gentoo'],
+            capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            return {'error': f'tar failed: {result.stderr[:200]}'}
+
+        size_bytes = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+        snap_id = db.record_snapshot(
+            filename=filename, timestamp=portage_ts,
+            size_bytes=size_bytes, trigger=trigger,
+            profile_id=profile_id, notes=notes)
+        log.info(f"Portage snapshot created: {filename} ({size_bytes // 1048576}MB)")
+        add_event('snapshot', f"Portage snapshot: {filename}",
+                  {'snapshot_id': snap_id, 'trigger': trigger, 'size_mb': size_bytes // 1048576})
+        return {'snapshot_id': snap_id, 'filename': filename,
+                'size_bytes': size_bytes, 'timestamp': portage_ts}
+    except Exception as e:
+        log.error(f"Snapshot creation failed: {e}")
+        return {'error': str(e)}
+
+
+def _resolve_profile_world(profile: dict) -> list:
+    """Read world packages from the profile's source.
+
+    Returns a list of package atoms (e.g. ['app-misc/jq', 'dev-vcs/git']).
+    """
+    source = profile.get('world_source', 'inline')
+
+    if source == 'inline':
+        # Packages stored directly in the database
+        return db.get_profile_packages(profile['id'])
+
+    elif source.startswith('local:'):
+        path = source[len('local:'):]
+        try:
+            with open(path) as f:
+                return [line.strip() for line in f if line.strip()
+                        and not line.startswith('#')]
+        except Exception as e:
+            log.error(f"Cannot read local world file {path}: {e}")
+            return []
+
+    elif source.startswith('ssh:'):
+        # ssh:user@host:/path
+        remote = source[len('ssh:'):]
+        try:
+            result = subprocess.run(
+                ['ssh', '-o', 'ConnectTimeout=10', '-o', 'StrictHostKeyChecking=no',
+                 remote.split(':')[0], f'cat {remote.split(":", 1)[1]}'],
+                capture_output=True, text=True, timeout=30)
+            if result.returncode != 0:
+                log.error(f"SSH world read failed: {result.stderr[:200]}")
+                return []
+            return [line.strip() for line in result.stdout.splitlines()
+                    if line.strip() and not line.startswith('#')]
+        except Exception as e:
+            log.error(f"SSH world read failed: {e}")
+            return []
+
+    return []
+
+
+def _resolve_emerge_tree(world_packages: list) -> list:
+    """Run emerge --pretend --emptytree to resolve the full dependency tree.
+
+    Takes a list of world atoms, returns resolved versioned atoms.
+    Same logic as cmd_fresh() but parameterized.
+    """
+    import re
+
+    if not world_packages:
+        return []
+
+    try:
+        result = subprocess.run(
+            ['emerge', '--pretend', '--emptytree'] + world_packages,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=600)
+    except FileNotFoundError:
+        log.error("emerge not found — cannot resolve package tree")
+        return []
+    except subprocess.TimeoutExpired:
+        log.error("emerge tree resolution timed out (10 min)")
+        return []
+
+    ebuild_re = re.compile(r'^\[ebuild\s+[^\]]*\]\s+(\S+)')
+    packages = []
+    for line in result.stdout.splitlines():
+        m = ebuild_re.match(line.strip())
+        if m:
+            atom = m.group(1)
+            if '::' in atom:
+                atom = atom.split('::')[0]
+            if not atom.startswith('='):
+                atom = f'={atom}'
+            packages.append(atom)
+
+    return packages
+
+
+def _diff_against_existing(resolved: list, profile: dict) -> list:
+    """Find packages from resolved list that aren't already successfully built.
+
+    For incremental sync: only queue packages that need building.
+    """
+    if not resolved:
+        return []
+
+    # Get previously built packages from build_history (successful)
+    built = set()
+    rows = db.fetchall("""
+        SELECT DISTINCT package FROM build_history WHERE status = 'success'
+    """)
+    for r in rows:
+        built.add(r['package'])
+
+    # Also skip anything already in queue as needed/delegated
+    in_queue = set()
+    rows = db.fetchall("""
+        SELECT DISTINCT package FROM queue WHERE status IN ('needed', 'delegated')
+    """)
+    for r in rows:
+        in_queue.add(r['package'])
+
+    missing = []
+    for pkg in resolved:
+        if pkg not in built and pkg not in in_queue:
+            missing.append(pkg)
+
+    return missing
+
+
+def _sync_profile(profile: dict, full: bool = False) -> dict:
+    """Sync a profile: resolve world → diff → queue builds.
+
+    Args:
+        profile: Profile dict from db.get_profile()
+        full: If True, queue ALL resolved packages (like fresh).
+              If False, only queue missing/changed packages.
+    """
+    import uuid
+    profile_id = profile['id']
+    log.info(f"[PROFILE-SYNC] Syncing profile: {profile_id} (full={full})")
+
+    # Step 1: Take a portage snapshot
+    snap = _create_portage_snapshot(trigger='profile_sync', profile_id=profile_id)
+    snapshot_id = snap.get('snapshot_id')
+
+    # Step 2: Read world packages from source
+    world_packages = _resolve_profile_world(profile)
+    if not world_packages:
+        return {'error': 'No world packages found', 'profile_id': profile_id}
+
+    # Store the resolved world in the profile (for inline source, this is identity)
+    if profile['world_source'] != 'inline':
+        db.update_profile_world(profile_id, world_packages)
+
+    # Step 3: Resolve full dependency tree
+    resolved = _resolve_emerge_tree(world_packages)
+    if not resolved:
+        return {'error': 'emerge tree resolution produced no packages',
+                'profile_id': profile_id, 'world_count': len(world_packages)}
+
+    # Step 4: Diff against existing builds (or use full list)
+    if full:
+        to_queue = resolved
+    else:
+        to_queue = _diff_against_existing(resolved, profile)
+
+    if not to_queue:
+        log.info(f"[PROFILE-SYNC] {profile_id}: all {len(resolved)} packages up to date")
+        db.update_profile(profile_id, portage_snapshot_id=snapshot_id)
+        db.execute("UPDATE build_profiles SET last_sync_at = ? WHERE id = ?",
+                   (time.time(), profile_id))
+        return {
+            'profile_id': profile_id,
+            'resolved': len(resolved),
+            'queued': 0,
+            'message': 'All packages up to date',
+        }
+
+    # Step 5: Create session and queue packages
+    session_id = f"profile-{profile_id}-{uuid.uuid4().hex[:8]}"
+    session_name = f"Profile sync: {profile['name']}"
+    db.create_session(session_id, name=session_name,
+                      total_packages=len(to_queue),
+                      profile_id=profile_id,
+                      portage_snapshot_id=snapshot_id)
+    added = db.queue_packages(to_queue, session_id=session_id,
+                              profile_id=profile_id)
+
+    # Step 6: Update profile metadata
+    db.update_profile(profile_id, portage_snapshot_id=snapshot_id)
+    db.execute("UPDATE build_profiles SET last_sync_at = ? WHERE id = ?",
+               (time.time(), profile_id))
+
+    log.info(f"[PROFILE-SYNC] {profile_id}: queued {added}/{len(to_queue)} "
+             f"(resolved {len(resolved)} total)")
+    add_event('profile', f"Profile sync: {profile['name']} — {added} packages queued",
+              {'profile_id': profile_id, 'resolved': len(resolved),
+               'queued': added, 'full': full})
+
+    return {
+        'profile_id': profile_id,
+        'session_id': session_id,
+        'resolved': len(resolved),
+        'queued': added,
+        'snapshot_id': snapshot_id,
+    }
+
+
+def _check_profile_auto_rebuild():
+    """Check if any profiles need auto-rebuild after portage sync."""
+    profiles = db.get_all_profiles()
+    current_ts = db.get_config('expected_portage_timestamp')
+    if not current_ts:
+        return
+
+    for profile in profiles:
+        if not profile.get('auto_rebuild'):
+            continue
+        # Check if portage tree changed since last sync
+        meta = profile.get('metadata', {})
+        last_ts = meta.get('last_portage_timestamp')
+        if last_ts == current_ts:
+            continue  # No change since last sync
+
+        log.info(f"[AUTO-REBUILD] Portage tree changed, syncing profile: {profile['id']}")
+        try:
+            result = _sync_profile(profile, full=False)
+            # Store the portage timestamp we synced against
+            meta['last_portage_timestamp'] = current_ts
+            db.execute(
+                "UPDATE build_profiles SET metadata_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(meta), time.time(), profile['id']))
+            queued = result.get('queued', 0)
+            if queued > 0:
+                log.info(f"[AUTO-REBUILD] {profile['id']}: queued {queued} packages")
+        except Exception as e:
+            log.error(f"[AUTO-REBUILD] {profile['id']} failed: {e}")
+
+
 def _maintenance_loop():
     """Background maintenance: reclaim work, update status, auto-age blocks."""
     _maint_cycle = 0
@@ -1136,6 +1637,10 @@ def _maintenance_loop():
             _maint_cycle += 1
             if _maint_cycle % 4 == 0:
                 _reclaim_stale_builds()
+
+            # Check for auto-rebuild every 20th cycle (~5 min)
+            if _maint_cycle % 20 == 0:
+                _check_profile_auto_rebuild()
         except Exception as e:
             log.error(f"Maintenance loop error: {e}")
 
@@ -1213,7 +1718,7 @@ def _session_monitor():
 
 def start(db_path: str = None, port: int = None):
     """Start the v3 control plane."""
-    global db, health_monitor, scheduler, release_mgr, _start_time
+    global db, health_monitor, scheduler, release_mgr, self_healing, proof_of_life, _start_time
 
     _start_time = time.time()
     port = port or cfg.CONTROL_PLANE_PORT
@@ -1233,6 +1738,14 @@ def start(db_path: str = None, port: int = None):
     # v3.1.1: Initialize release manager
     from .releases import ReleaseManager
     release_mgr = ReleaseManager(db)
+
+    # v4: Initialize payload manager
+    from .payloads import init_payloads
+    init_payloads(db)
+
+    # v4: Initialize self-healing monitor and proof-of-life prober
+    self_healing = SelfHealingMonitor(db, health_monitor)
+    proof_of_life = ProofOfLifeProber(db)
 
     log.info(f"=== Build Swarm v3 Control Plane v{__version__} ===")
     log.info(f"Database: {db_path}")
@@ -1255,8 +1768,11 @@ def start(db_path: str = None, port: int = None):
     threading.Thread(target=_maintenance_loop, daemon=True).start()
     threading.Thread(target=_session_monitor, daemon=True).start()
     threading.Thread(target=_protocol_prune_loop, daemon=True).start()
-    threading.Thread(target=_drone_health_probe_loop, daemon=True).start()
-    log.info("Background threads started (metrics, maintenance, session monitor, protocol/event prune, health probe)")
+
+    # v4: Start self-healing monitor (replaces old health probe loop)
+    self_healing.start()
+
+    log.info("Background threads started (metrics, maintenance, session monitor, protocol/event prune, self-healing)")
 
     # Start admin dashboard server on secondary port
     try:

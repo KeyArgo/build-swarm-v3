@@ -113,9 +113,31 @@ class SwarmDB:
                 conn.execute("ALTER TABLE drone_health ADD COLUMN upload_failures INTEGER DEFAULT 0")
             if 'last_upload_failure' not in cols:
                 conn.execute("ALTER TABLE drone_health ADD COLUMN last_upload_failure REAL")
+            # v4: Self-healing escalation tracking
+            if 'escalation_level' not in cols:
+                conn.execute("ALTER TABLE drone_health ADD COLUMN escalation_level INTEGER DEFAULT 0")
+            if 'last_escalation_at' not in cols:
+                conn.execute("ALTER TABLE drone_health ADD COLUMN last_escalation_at REAL")
+            if 'escalation_attempts' not in cols:
+                conn.execute("ALTER TABLE drone_health ADD COLUMN escalation_attempts INTEGER DEFAULT 0")
             conn.commit()
         except Exception as e:
             log.debug(f"Migration note: {e}")
+
+        # v4: Add self-healing columns to nodes table
+        try:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(nodes)").fetchall()}
+            if 'drone_type' not in cols:
+                conn.execute("ALTER TABLE nodes ADD COLUMN drone_type TEXT DEFAULT 'unknown'")
+            if 'last_ping_at' not in cols:
+                conn.execute("ALTER TABLE nodes ADD COLUMN last_ping_at REAL")
+            if 'last_pong_at' not in cols:
+                conn.execute("ALTER TABLE nodes ADD COLUMN last_pong_at REAL")
+            if 'ping_latency_ms' not in cols:
+                conn.execute("ALTER TABLE nodes ADD COLUMN ping_latency_ms REAL")
+            conn.commit()
+        except Exception as e:
+            log.debug(f"Nodes v4 migration note: {e}")
 
         # Add building_since column to queue table (v3.2 delegation fix)
         try:
@@ -206,6 +228,77 @@ class SwarmDB:
                 log.info(f"Seeded {len(defaults)} global allowlist defaults ({sum(1 for e in defaults if len(e) > 2 and e[2])} protected)")
         except Exception as e:
             log.debug(f"Allowlist migration note: {e}")
+
+        # Build profiles table (v3.3 — profile-based builds)
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS build_profiles (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    profile_type TEXT NOT NULL
+                        CHECK(profile_type IN ('distribution', 'user')),
+                    world_source TEXT NOT NULL,
+                    world_packages TEXT,
+                    world_hash TEXT,
+                    auto_rebuild INTEGER DEFAULT 0,
+                    binhost_ip TEXT,
+                    binhost_path TEXT,
+                    portage_snapshot_id INTEGER,
+                    metadata_json TEXT,
+                    created_at REAL DEFAULT (strftime('%s','now')),
+                    updated_at REAL DEFAULT (strftime('%s','now')),
+                    last_sync_at REAL
+                )
+            """)
+            conn.commit()
+        except Exception as e:
+            log.debug(f"Build profiles migration note: {e}")
+
+        # Portage snapshots table (v3.3 — portage tree archival)
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS portage_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    filename TEXT NOT NULL UNIQUE,
+                    timestamp TEXT NOT NULL,
+                    size_bytes INTEGER,
+                    trigger TEXT,
+                    profile_id TEXT,
+                    notes TEXT,
+                    created_at REAL DEFAULT (strftime('%s','now'))
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_timestamp ON portage_snapshots(timestamp)")
+            conn.commit()
+        except Exception as e:
+            log.debug(f"Portage snapshots migration note: {e}")
+
+        # Add profile_id to queue, sessions, build_history (v3.3)
+        for table in ('queue', 'sessions', 'build_history'):
+            try:
+                cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                if 'profile_id' not in cols:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN profile_id TEXT")
+                    conn.commit()
+                    log.info(f"Added profile_id column to {table}")
+            except Exception as e:
+                log.debug(f"{table} profile_id migration note: {e}")
+
+        # Add portage_snapshot_id to sessions (v3.3)
+        try:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+            if 'portage_snapshot_id' not in cols:
+                conn.execute("ALTER TABLE sessions ADD COLUMN portage_snapshot_id INTEGER")
+                conn.commit()
+        except Exception as e:
+            log.debug(f"Sessions portage_snapshot_id migration note: {e}")
+
+        # Index for profile-filtered queue lookups
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_profile ON queue(profile_id, status)")
+            conn.commit()
+        except Exception as e:
+            log.debug(f"Queue profile index note: {e}")
 
         # Migration: add protected column if missing + mark critical entries
         try:
@@ -375,6 +468,74 @@ class SwarmDB:
         """Resolve a drone name to its ID. Returns None if not found."""
         return self.fetchval("SELECT id FROM nodes WHERE name = ?", (name,))
 
+    def set_drone_type(self, node_id: str, drone_type: str) -> bool:
+        """Set the drone type (lxc, qemu, bare-metal, unknown)."""
+        cursor = self.execute(
+            "UPDATE nodes SET drone_type = ? WHERE id = ?",
+            (drone_type, node_id))
+        return cursor.rowcount > 0
+
+    def get_drone_type(self, node_id: str) -> str:
+        """Get the drone type."""
+        return self.fetchval(
+            "SELECT drone_type FROM nodes WHERE id = ?", (node_id,)) or 'unknown'
+
+    def update_ping_result(self, node_id: str, latency_ms: float):
+        """Update ping/pong results for a node."""
+        now = time.time()
+        self.execute("""
+            UPDATE nodes SET
+                last_ping_at = ?,
+                last_pong_at = ?,
+                ping_latency_ms = ?
+            WHERE id = ?
+        """, (now, now, latency_ms, node_id))
+
+    def update_escalation_state(self, node_id: str, level: int, attempts: int = None):
+        """Update escalation state in drone_health."""
+        now = time.time()
+        if attempts is not None:
+            self.execute("""
+                INSERT INTO drone_health (node_id, escalation_level, last_escalation_at, escalation_attempts)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(node_id) DO UPDATE SET
+                    escalation_level = excluded.escalation_level,
+                    last_escalation_at = excluded.last_escalation_at,
+                    escalation_attempts = excluded.escalation_attempts
+            """, (node_id, level, now, attempts))
+        else:
+            self.execute("""
+                INSERT INTO drone_health (node_id, escalation_level, last_escalation_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(node_id) DO UPDATE SET
+                    escalation_level = excluded.escalation_level,
+                    last_escalation_at = excluded.last_escalation_at
+            """, (node_id, level, now))
+
+    def reset_escalation_state(self, node_id: str):
+        """Reset escalation state when drone recovers."""
+        self.execute("""
+            UPDATE drone_health SET
+                escalation_level = 0,
+                escalation_attempts = 0,
+                last_escalation_at = NULL
+            WHERE node_id = ?
+        """, (node_id,))
+
+    def get_escalation_state(self, node_id: str) -> dict:
+        """Get current escalation state for a drone."""
+        row = self.fetchone("""
+            SELECT escalation_level, last_escalation_at, escalation_attempts
+            FROM drone_health WHERE node_id = ?
+        """, (node_id,))
+        if row:
+            return {
+                'level': row['escalation_level'] or 0,
+                'last_escalation_at': row['last_escalation_at'],
+                'attempts': row['escalation_attempts'] or 0,
+            }
+        return {'level': 0, 'last_escalation_at': None, 'attempts': 0}
+
     def _row_to_node(self, row: sqlite3.Row) -> dict:
         """Convert a database row to a node dict."""
         d = dict(row)
@@ -387,12 +548,15 @@ class SwarmDB:
     # ── Session Operations ───────────────────────────────────────────
 
     def create_session(self, session_id: str, name: str = None,
-                       total_packages: int = 0) -> dict:
+                       total_packages: int = 0, profile_id: str = None,
+                       portage_snapshot_id: int = None) -> dict:
         """Create a new build session."""
         self.execute("""
-            INSERT INTO sessions (id, name, total_packages) VALUES (?, ?, ?)
-        """, (session_id, name, total_packages))
-        return {'id': session_id, 'name': name, 'status': 'active'}
+            INSERT INTO sessions (id, name, total_packages, profile_id, portage_snapshot_id)
+            VALUES (?, ?, ?, ?, ?)
+        """, (session_id, name, total_packages, profile_id, portage_snapshot_id))
+        return {'id': session_id, 'name': name, 'status': 'active',
+                'profile_id': profile_id}
 
     def get_session(self, session_id: str) -> Optional[dict]:
         """Get a session by ID."""
@@ -423,7 +587,8 @@ class SwarmDB:
 
     # ── Queue Operations ─────────────────────────────────────────────
 
-    def queue_packages(self, packages: List[str], session_id: str = None) -> int:
+    def queue_packages(self, packages: List[str], session_id: str = None,
+                       profile_id: str = None) -> int:
         """Add packages to the queue. Returns count added."""
         added = 0
         for raw_pkg in packages:
@@ -438,21 +603,29 @@ class SwarmDB:
                 continue
 
             self.execute("""
-                INSERT INTO queue (package, status, session_id)
-                VALUES (?, 'needed', ?)
-            """, (pkg, session_id))
+                INSERT INTO queue (package, status, session_id, profile_id)
+                VALUES (?, 'needed', ?, ?)
+            """, (pkg, session_id, profile_id))
             added += 1
 
         return added
 
-    def get_queue_counts(self, session_id: str = None) -> dict:
+    def get_queue_counts(self, session_id: str = None,
+                         profile_id: str = None) -> dict:
         """Get queue status counts."""
-        where = "WHERE session_id = ?" if session_id else ""
-        params = (session_id,) if session_id else ()
+        conditions = []
+        params = []
+        if session_id:
+            conditions.append("session_id = ?")
+            params.append(session_id)
+        if profile_id:
+            conditions.append("profile_id = ?")
+            params.append(profile_id)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
         rows = self.fetchall(f"""
             SELECT status, COUNT(*) as cnt FROM queue {where} GROUP BY status
-        """, params)
+        """, tuple(params))
 
         counts = {'needed': 0, 'delegated': 0, 'received': 0,
                   'blocked': 0, 'failed': 0}
@@ -463,18 +636,22 @@ class SwarmDB:
         return counts
 
     def get_needed_packages(self, limit: int = 50,
-                            session_id: str = None) -> List[dict]:
+                            session_id: str = None,
+                            profile_id: str = None) -> List[dict]:
         """Get packages waiting to be built."""
+        conditions = ["status = 'needed'"]
+        params = []
         if session_id:
-            rows = self.fetchall("""
-                SELECT * FROM queue WHERE status = 'needed' AND session_id = ?
-                ORDER BY id LIMIT ?
-            """, (session_id, limit))
-        else:
-            rows = self.fetchall("""
-                SELECT * FROM queue WHERE status = 'needed'
-                ORDER BY id LIMIT ?
-            """, (limit,))
+            conditions.append("session_id = ?")
+            params.append(session_id)
+        if profile_id:
+            conditions.append("profile_id = ?")
+            params.append(profile_id)
+        where = " AND ".join(conditions)
+        params.append(limit)
+        rows = self.fetchall(
+            f"SELECT * FROM queue WHERE {where} ORDER BY id LIMIT ?",
+            tuple(params))
         return [dict(r) for r in rows]
 
     def get_delegated_packages(self, drone_id: str = None) -> List[dict]:
@@ -557,18 +734,21 @@ class SwarmDB:
                 """, (new_status, new_count, error_message, new_assigned,
                       new_status, row['id']))
 
-        # Record in build history
+        # Record in build history (propagate profile_id from queue)
         drone_name = self.get_drone_name(drone_id)
         session = self.get_active_session()
         session_id = session['id'] if session else None
+        queue_row = self.fetchone(
+            "SELECT profile_id FROM queue WHERE package = ? LIMIT 1", (package,))
+        hist_profile_id = queue_row['profile_id'] if queue_row else None
 
         self.execute("""
             INSERT INTO build_history
                 (package, drone_id, drone_name, status, duration_seconds,
-                 error_message, session_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                 error_message, session_id, profile_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (package, drone_id, drone_name, status, duration_seconds,
-              error_message, session_id))
+              error_message, session_id, hist_profile_id))
 
         # Update session counts
         if session_id:
@@ -1086,6 +1266,291 @@ class SwarmDB:
                 "DELETE FROM drone_allowlist WHERE package = ? AND drone_id IS NULL AND protected = 0",
                 (package,))
         return cursor.rowcount > 0
+
+    # ── Build Profiles ───────────────────────────────────────────────
+
+    def create_profile(self, profile_id: str, name: str, profile_type: str,
+                       world_source: str, auto_rebuild: bool = False,
+                       binhost_ip: str = None, binhost_path: str = None,
+                       metadata: dict = None) -> dict:
+        """Create a new build profile."""
+        self.execute("""
+            INSERT INTO build_profiles (id, name, profile_type, world_source,
+                auto_rebuild, binhost_ip, binhost_path, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (profile_id, name, profile_type, world_source,
+              1 if auto_rebuild else 0, binhost_ip, binhost_path,
+              json.dumps(metadata) if metadata else None))
+        return self.get_profile(profile_id)
+
+    def get_profile(self, profile_id: str) -> Optional[dict]:
+        """Get a build profile by ID."""
+        row = self.fetchone("SELECT * FROM build_profiles WHERE id = ?",
+                            (profile_id,))
+        if not row:
+            return None
+        d = dict(row)
+        d['metadata'] = json.loads(d.pop('metadata_json') or '{}')
+        d['auto_rebuild'] = bool(d['auto_rebuild'])
+        return d
+
+    def get_all_profiles(self) -> List[dict]:
+        """Get all build profiles."""
+        rows = self.fetchall("SELECT * FROM build_profiles ORDER BY name")
+        result = []
+        for row in rows:
+            d = dict(row)
+            d['metadata'] = json.loads(d.pop('metadata_json') or '{}')
+            d['auto_rebuild'] = bool(d['auto_rebuild'])
+            result.append(d)
+        return result
+
+    def update_profile(self, profile_id: str, **fields) -> Optional[dict]:
+        """Update specific fields on a profile."""
+        allowed = {'name', 'profile_type', 'world_source', 'auto_rebuild',
+                   'binhost_ip', 'binhost_path', 'portage_snapshot_id'}
+        updates = []
+        values = []
+        for key, val in fields.items():
+            if key in allowed:
+                if key == 'auto_rebuild':
+                    val = 1 if val else 0
+                updates.append(f"{key} = ?")
+                values.append(val)
+        if not updates:
+            return self.get_profile(profile_id)
+        updates.append("updated_at = ?")
+        values.append(time.time())
+        values.append(profile_id)
+        self.execute(
+            f"UPDATE build_profiles SET {', '.join(updates)} WHERE id = ?",
+            tuple(values))
+        return self.get_profile(profile_id)
+
+    def update_profile_world(self, profile_id: str, packages: List[str]) -> dict:
+        """Update the resolved world packages for a profile."""
+        import hashlib
+        sorted_pkgs = sorted(set(packages))
+        world_text = '\n'.join(sorted_pkgs)
+        world_hash = hashlib.sha256(world_text.encode()).hexdigest()[:16]
+
+        self.execute("""
+            UPDATE build_profiles
+            SET world_packages = ?, world_hash = ?, updated_at = ?
+            WHERE id = ?
+        """, (world_text, world_hash, time.time(), profile_id))
+        return {'package_count': len(sorted_pkgs), 'world_hash': world_hash}
+
+    def get_profile_packages(self, profile_id: str) -> List[str]:
+        """Get the resolved package list for a profile."""
+        text = self.fetchval(
+            "SELECT world_packages FROM build_profiles WHERE id = ?",
+            (profile_id,))
+        if not text:
+            return []
+        return [p for p in text.strip().split('\n') if p]
+
+    def delete_profile(self, profile_id: str) -> bool:
+        """Delete a build profile."""
+        cursor = self.execute("DELETE FROM build_profiles WHERE id = ?",
+                              (profile_id,))
+        return cursor.rowcount > 0
+
+    # ── Portage Snapshots ────────────────────────────────────────────
+
+    def record_snapshot(self, filename: str, timestamp: str,
+                        size_bytes: int = None, trigger: str = None,
+                        profile_id: str = None, notes: str = None) -> int:
+        """Record a portage tree snapshot in the database. Returns row ID."""
+        cursor = self.execute("""
+            INSERT INTO portage_snapshots
+                (filename, timestamp, size_bytes, trigger, profile_id, notes)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (filename, timestamp, size_bytes, trigger, profile_id, notes))
+        return cursor.lastrowid
+
+    def get_snapshots(self, limit: int = 50) -> List[dict]:
+        """Get portage snapshots, most recent first."""
+        rows = self.fetchall("""
+            SELECT * FROM portage_snapshots ORDER BY created_at DESC LIMIT ?
+        """, (limit,))
+        return [dict(r) for r in rows]
+
+    def get_latest_snapshot(self) -> Optional[dict]:
+        """Get the most recent portage snapshot."""
+        row = self.fetchone(
+            "SELECT * FROM portage_snapshots ORDER BY created_at DESC LIMIT 1")
+        return dict(row) if row else None
+
+    def get_snapshot(self, snapshot_id: int) -> Optional[dict]:
+        """Get a snapshot by ID."""
+        row = self.fetchone(
+            "SELECT * FROM portage_snapshots WHERE id = ?", (snapshot_id,))
+        return dict(row) if row else None
+
+    # ── Payload Versioning (v4) ─────────────────────────────────────────
+
+    def create_payload_version(self, payload_type: str, version: str, hash: str,
+                               content_path: str = None, content_blob: bytes = None,
+                               description: str = None, notes: str = None,
+                               created_by: str = None) -> int:
+        """Create a new payload version. Returns row ID."""
+        cursor = self.execute("""
+            INSERT INTO payload_versions
+                (payload_type, version, hash, content_path, content_blob,
+                 description, notes, created_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (payload_type, version, hash, content_path, content_blob,
+              description, notes, created_by))
+        return cursor.lastrowid
+
+    def get_payload_version(self, payload_type: str, version: str) -> Optional[dict]:
+        """Get a specific payload version."""
+        row = self.fetchone("""
+            SELECT id, payload_type, version, hash, content_path, description, notes,
+                   created_at, created_by
+            FROM payload_versions
+            WHERE payload_type = ? AND version = ?
+        """, (payload_type, version))
+        return dict(row) if row else None
+
+    def get_payload_versions(self, payload_type: str = None, limit: int = 50) -> List[dict]:
+        """Get payload versions, optionally filtered by type."""
+        if payload_type:
+            rows = self.fetchall("""
+                SELECT id, payload_type, version, hash, content_path, description, notes,
+                       created_at, created_by
+                FROM payload_versions WHERE payload_type = ?
+                ORDER BY created_at DESC LIMIT ?
+            """, (payload_type, limit))
+        else:
+            rows = self.fetchall("""
+                SELECT id, payload_type, version, hash, content_path, description, notes,
+                       created_at, created_by
+                FROM payload_versions ORDER BY created_at DESC LIMIT ?
+            """, (limit,))
+        return [dict(r) for r in rows]
+
+    def get_latest_payload_version(self, payload_type: str) -> Optional[dict]:
+        """Get the most recent version of a payload type."""
+        row = self.fetchone("""
+            SELECT id, payload_type, version, hash, content_path, description, notes,
+                   created_at, created_by
+            FROM payload_versions
+            WHERE payload_type = ? ORDER BY created_at DESC LIMIT 1
+        """, (payload_type,))
+        return dict(row) if row else None
+
+    def set_drone_payload(self, drone_id: str, payload_type: str, version: str,
+                          hash: str, status: str = 'deployed',
+                          deployed_by: str = None) -> bool:
+        """Set or update the payload version for a drone."""
+        now = time.time()
+        self.execute("""
+            INSERT INTO drone_payloads
+                (drone_id, payload_type, version, hash, status, deployed_at, deployed_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(drone_id, payload_type) DO UPDATE SET
+                version = excluded.version,
+                hash = excluded.hash,
+                status = excluded.status,
+                deployed_at = excluded.deployed_at,
+                deployed_by = excluded.deployed_by,
+                error_message = NULL
+        """, (drone_id, payload_type, version, hash, status, now, deployed_by))
+        return True
+
+    def get_drone_payload(self, drone_id: str, payload_type: str) -> Optional[dict]:
+        """Get a specific payload for a drone."""
+        row = self.fetchone("""
+            SELECT * FROM drone_payloads WHERE drone_id = ? AND payload_type = ?
+        """, (drone_id, payload_type))
+        return dict(row) if row else None
+
+    def get_drone_payloads(self, drone_id: str) -> List[dict]:
+        """Get all payloads for a drone."""
+        rows = self.fetchall("""
+            SELECT * FROM drone_payloads WHERE drone_id = ? ORDER BY payload_type
+        """, (drone_id,))
+        return [dict(r) for r in rows]
+
+    def get_all_drone_payloads(self, payload_type: str = None) -> Dict[str, dict]:
+        """Get payload versions for all drones (useful for version matrix)."""
+        if payload_type:
+            rows = self.fetchall("""
+                SELECT dp.drone_id, dp.payload_type, dp.version, dp.hash, dp.status,
+                       dp.deployed_at, n.name as drone_name
+                FROM drone_payloads dp
+                JOIN nodes n ON n.id = dp.drone_id
+                WHERE dp.payload_type = ?
+            """, (payload_type,))
+        else:
+            rows = self.fetchall("""
+                SELECT dp.drone_id, dp.payload_type, dp.version, dp.hash, dp.status,
+                       dp.deployed_at, n.name as drone_name
+                FROM drone_payloads dp
+                JOIN nodes n ON n.id = dp.drone_id
+            """)
+        result = {}
+        for row in rows:
+            d = dict(row)
+            drone_name = d.pop('drone_name', d['drone_id'])
+            if drone_name not in result:
+                result[drone_name] = {}
+            result[drone_name][d['payload_type']] = d
+        return result
+
+    def log_payload_deploy(self, drone_id: str, payload_type: str, version: str,
+                           action: str, status: str, duration_ms: float = None,
+                           error_message: str = None, deployed_by: str = None) -> int:
+        """Log a payload deployment attempt. Returns row ID."""
+        cursor = self.execute("""
+            INSERT INTO payload_deploy_log
+                (drone_id, payload_type, version, action, status, duration_ms,
+                 error_message, deployed_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (drone_id, payload_type, version, action, status, duration_ms,
+              error_message, deployed_by))
+        return cursor.lastrowid
+
+    def get_payload_deploy_history(self, drone_id: str = None, limit: int = 100) -> List[dict]:
+        """Get payload deployment history, optionally filtered by drone."""
+        if drone_id:
+            rows = self.fetchall("""
+                SELECT pdl.*, n.name as drone_name
+                FROM payload_deploy_log pdl
+                LEFT JOIN nodes n ON n.id = pdl.drone_id
+                WHERE pdl.drone_id = ?
+                ORDER BY pdl.deployed_at DESC LIMIT ?
+            """, (drone_id, limit))
+        else:
+            rows = self.fetchall("""
+                SELECT pdl.*, n.name as drone_name
+                FROM payload_deploy_log pdl
+                LEFT JOIN nodes n ON n.id = pdl.drone_id
+                ORDER BY pdl.deployed_at DESC LIMIT ?
+            """, (limit,))
+        return [dict(r) for r in rows]
+
+    def get_outdated_drones(self, payload_type: str) -> List[dict]:
+        """Get drones that don't have the latest version of a payload."""
+        latest = self.get_latest_payload_version(payload_type)
+        if not latest:
+            return []
+        rows = self.fetchall("""
+            SELECT n.id as drone_id, n.name, n.ip, n.status,
+                   dp.version as current_version, dp.hash as current_hash,
+                   dp.deployed_at
+            FROM nodes n
+            LEFT JOIN drone_payloads dp ON dp.drone_id = n.id AND dp.payload_type = ?
+            WHERE n.type = 'drone'
+              AND (dp.version IS NULL OR dp.version != ? OR dp.hash != ?)
+        """, (payload_type, latest['version'], latest['hash']))
+        return [{
+            **dict(r),
+            'latest_version': latest['version'],
+            'latest_hash': latest['hash']
+        } for r in rows]
 
     # ── Utility ───────────────────────────────────────────────────────
 

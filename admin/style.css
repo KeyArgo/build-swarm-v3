@@ -561,3 +561,147 @@ tr:hover td { background: rgba(6, 182, 212, 0.03); }
   .header { padding: 0.5rem 1rem; }
   .tab-content { padding: 1rem; }
 }
+
+/* ═══════════════════════════════════════════════════════════
+   v4: Heartbeat Visualization Animations
+   ═══════════════════════════════════════════════════════════ */
+
+/* Animated packet/heartbeat dot */
+@keyframes packet-travel {
+  0% { opacity: 1; offset-distance: 0%; }
+  100% { opacity: 0.3; offset-distance: 100%; }
+}
+
+@keyframes pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.5); opacity: 0.5; }
+}
+
+@keyframes glow-pulse {
+  0%, 100% { filter: drop-shadow(0 0 2px currentColor); }
+  50% { filter: drop-shadow(0 0 8px currentColor); }
+}
+
+/* Topology packet animations */
+.topology-packet {
+  animation: packet-travel 1.5s linear forwards;
+  offset-rotate: 0deg;
+}
+
+.topology-packet.heartbeat {
+  fill: var(--cyan);
+}
+
+.topology-packet.work-request {
+  fill: var(--green);
+}
+
+.topology-packet.complete {
+  fill: var(--green);
+}
+
+.topology-packet.failure {
+  fill: var(--red);
+}
+
+/* Drone status indicators */
+.drone-pulse {
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.drone-glow {
+  animation: glow-pulse 2s ease-in-out infinite;
+}
+
+/* Self-healing escalation levels */
+.escalation-0 { color: var(--green); }
+.escalation-1 { color: var(--amber); }
+.escalation-2 { color: #fb923c; } /* orange */
+.escalation-3 { color: var(--red); }
+.escalation-4 { color: #dc2626; animation: pulse 1s ease-in-out infinite; }
+
+/* Heartbeat activity indicator */
+.heartbeat-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--cyan);
+  display: inline-block;
+  margin-right: 0.5rem;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.heartbeat-dot.inactive {
+  background: var(--text-muted);
+  animation: none;
+}
+
+/* Live activity feed styling */
+.activity-pulse {
+  position: relative;
+}
+
+.activity-pulse::before {
+  content: '';
+  position: absolute;
+  left: -12px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--cyan);
+  animation: pulse 1s ease-out;
+}
+
+/* Network topology enhancements */
+#topology-svg svg {
+  transition: all 0.3s ease;
+}
+
+#topology-svg .node-box {
+  transition: all 0.3s ease;
+}
+
+#topology-svg .node-box:hover {
+  filter: brightness(1.2);
+  cursor: pointer;
+}
+
+/* Connection line animations */
+@keyframes dash-flow {
+  to { stroke-dashoffset: -20; }
+}
+
+.connection-animated {
+  animation: dash-flow 1s linear infinite;
+}
+
+/* Escalation status cards */
+.escalation-card {
+  padding: 0.75rem;
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  margin-bottom: 0.5rem;
+}
+
+.escalation-card.level-0 { border-left: 3px solid var(--green); }
+.escalation-card.level-1 { border-left: 3px solid var(--amber); }
+.escalation-card.level-2 { border-left: 3px solid #fb923c; }
+.escalation-card.level-3 { border-left: 3px solid var(--red); }
+.escalation-card.level-4 {
+  border-left: 3px solid #dc2626;
+  background: rgba(239, 68, 68, 0.1);
+}
+
+/* Self-healing status panel */
+.self-healing-status {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 1rem;
+}
+
+.self-healing-status .status-ok { color: var(--green); }
+.self-healing-status .status-warning { color: var(--amber); }
+.self-healing-status .status-critical { color: var(--red); }

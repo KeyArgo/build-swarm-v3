@@ -1,3 +1,3 @@
-"""Build Swarm v3 - Unified Control Plane."""
+"""Build Swarm v4 - Unified Control Plane with Self-Healing."""
 
-__version__ = '3.1.0'
+__version__ = '0.4.0-alpha'
