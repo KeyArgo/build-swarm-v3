@@ -329,8 +329,12 @@ class SelfHealingMonitor:
                 state['consecutive_failures'] = 0
                 state['first_failure_at'] = 0
                 self.escalation_state[drone_id] = state
-                add_event('warn', f"{drone_name} probe unreachable but heartbeat is fresh",
-                          {'drone': drone_name, 'status': status})
+                # Rate-limit warning events to keep the feed actionable.
+                last_warn = state.get('last_warn_at', 0)
+                if (now - last_warn) >= 300:
+                    add_event('warn', f"{drone_name} probe unreachable but heartbeat is fresh",
+                              {'drone': drone_name, 'status': status})
+                    state['last_warn_at'] = now
                 return
 
             if not state.get('first_failure_at'):
