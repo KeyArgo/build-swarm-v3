@@ -26,6 +26,11 @@ class Scheduler:
         # Track packages rebalanced away from drones (drone_id -> set of packages)
         self._rebalanced = {}  # type: dict[str, set[str]]
 
+    def _mark_revoked(self, drone_id: str, package: str):
+        if drone_id not in self._rebalanced:
+            self._rebalanced[drone_id] = set()
+        self._rebalanced[drone_id].add(package)
+
     def is_valid_assignment(self, drone_id: str, package: str) -> bool:
         """Check if a package is currently assigned to this drone.
 
@@ -231,10 +236,12 @@ class Scheduler:
         if drone_queues.get(drone_id):
             return 0
 
-        # Find donors with >2 packages
+        # Find donors with more than one package queued.
+        # Keeping one package with donor avoids starvation while letting
+        # late/idle drones contribute quickly.
         donors = []
         for did, pkgs in drone_queues.items():
-            if len(pkgs) <= 2:
+            if len(pkgs) <= 1:
                 continue
             # Check donor is online
             donor_node = self.db.get_node(did)
@@ -270,7 +277,7 @@ class Scheduler:
                 if stolen >= queue_target or taken >= max_take:
                     break
                 remaining = len(donor_pkgs) - taken
-                if remaining <= 2:
+                if remaining <= 1:
                     break
 
                 # v3.2: Never steal a package confirmed as actively building
@@ -281,11 +288,6 @@ class Scheduler:
                 if donor_current_task and pkg['package'] == donor_current_task:
                     continue
 
-                # v3.2: Only steal packages assigned recently (< 60s) — older ones
-                # are likely already being compiled or queued in emerge
-                if pkg.get('assigned_at') and (time.time() - pkg['assigned_at']) > 60:
-                    continue
-
                 # Reassign (clear building_since since new drone hasn't started)
                 self.db.execute("""
                     UPDATE queue SET assigned_to = ?, assigned_at = ?,
@@ -294,9 +296,7 @@ class Scheduler:
                 """, (drone_id, time.time(), pkg['id'], donor_id))
 
                 # v3.1: Track rebalanced packages so stale completions can be discarded
-                if donor_id not in self._rebalanced:
-                    self._rebalanced[donor_id] = set()
-                self._rebalanced[donor_id].add(pkg['package'])
+                self._mark_revoked(donor_id, pkg['package'])
 
                 stolen += 1
                 taken += 1
@@ -311,7 +311,14 @@ class Scheduler:
         return stolen
 
     def reclaim_offline_work(self, timeout_minutes: int = 5):
-        """Reclaim work from offline/timed-out drones."""
+        """Reclaim work from offline or truly stale drones.
+
+        Reliability rules:
+        - Reclaim immediately when drone is offline/missing.
+        - For online drones, reclaim only if heartbeat is stale.
+        - Do NOT reclaim active long builds (building_since/current_task present).
+        - Optionally reclaim not-started delegated work after timeout.
+        """
         cutoff = time.time() - (timeout_minutes * 60)
         delegated = self.db.get_delegated_packages()
         reclaimed = 0
@@ -326,13 +333,25 @@ class Scheduler:
             if not node or node['status'] != 'online':
                 should_reclaim = True
                 reason = "drone offline"
-            elif pkg['assigned_at'] and pkg['assigned_at'] < cutoff:
-                should_reclaim = True
-                reason = f"build timeout (>{timeout_minutes}m)"
+            else:
+                last_seen = node.get('last_seen') or 0
+                heartbeat_stale = bool(last_seen and last_seen < cutoff)
+
+                # Never reclaim if the drone is actively building and heartbeating.
+                actively_building = bool(pkg.get('building_since')) or bool(node.get('current_task'))
+
+                if heartbeat_stale:
+                    should_reclaim = True
+                    reason = f"heartbeat stale (>{timeout_minutes}m)"
+                elif (not actively_building and
+                      pkg.get('assigned_at') and pkg['assigned_at'] < cutoff):
+                    should_reclaim = True
+                    reason = f"not-started timeout (>{timeout_minutes}m)"
 
             if should_reclaim:
                 drone_name = self.db.get_drone_name(drone_id)
                 self.db.reclaim_package(pkg['package'])
+                self._mark_revoked(drone_id, pkg['package'])
                 log.warning(f"[RECLAIM] {pkg['package']} from {drone_name} - {reason}")
                 add_event('reclaim', f"{pkg['package']} reclaimed from {drone_name} ({reason})",
                           {'package': pkg['package'], 'drone': drone_name, 'reason': reason})
@@ -340,6 +359,50 @@ class Scheduler:
 
         if reclaimed:
             log.info(f"[RECLAIM] Total {reclaimed} packages reclaimed")
+        return reclaimed
+
+    def reclaim_expired_leases(self, lease_seconds: int = 120) -> int:
+        """Reclaim delegated packages from drones that stopped heartbeating."""
+        now = time.time()
+        delegated = self.db.get_delegated_packages()
+        reclaimed = 0
+
+        for pkg in delegated:
+            drone_id = pkg.get('assigned_to')
+            if not drone_id:
+                continue
+
+            assigned_at = pkg.get('assigned_at') or 0
+            if assigned_at and (now - assigned_at) < lease_seconds:
+                continue
+
+            node = self.db.get_node(drone_id)
+            if not node:
+                stale = True
+                heartbeat_age = None
+            else:
+                last_seen = node.get('last_seen') or 0
+                heartbeat_age = now - last_seen if last_seen else None
+                stale = (heartbeat_age is None) or (heartbeat_age >= lease_seconds)
+
+            if not stale:
+                continue
+
+            package = pkg['package']
+            drone_name = self.db.get_drone_name(drone_id)
+            if self.db.reclaim_package(package):
+                self._mark_revoked(drone_id, package)
+                reclaimed += 1
+                if heartbeat_age is None:
+                    reason = f"lease expired ({lease_seconds}s), node missing"
+                else:
+                    reason = f"lease expired ({lease_seconds}s), heartbeat age={int(heartbeat_age)}s"
+                log.warning(f"[LEASE-RECLAIM] {package} from {drone_name}: {reason}")
+                add_event('reclaim', f"{package} reclaimed from {drone_name} ({reason})",
+                          {'package': package, 'drone': drone_name, 'reason': reason})
+
+        if reclaimed:
+            log.info(f"[LEASE-RECLAIM] reclaimed {reclaimed} packages")
         return reclaimed
 
     def auto_age_blocked(self):

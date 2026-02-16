@@ -302,11 +302,27 @@ class SelfHealingMonitor:
                 'level': 0,
                 'last_action': 0,
                 'attempts': 0,
+                'consecutive_failures': 0,
             })
 
             current_level = state['level']
             last_action = state['last_action']
             now = time.time()
+
+            # Treat disk warning as non-escalating telemetry.
+            if status == 'disk_warning':
+                state['consecutive_failures'] = 0
+                self.escalation_state[drone_id] = state
+                add_event('warn', f"{drone_name} disk usage warning",
+                          {'drone': drone_name, 'status': status})
+                return
+
+            state['consecutive_failures'] = state.get('consecutive_failures', 0) + 1
+            # Require two consecutive failed probes before escalating to reduce
+            # false positives from transient SSH/network blips.
+            if state['consecutive_failures'] < 2:
+                self.escalation_state[drone_id] = state
+                return
 
             # Check if we should escalate
             if current_level < EscalationLevel.ALERT_ADMIN:
@@ -316,14 +332,18 @@ class SelfHealingMonitor:
 
                     # Wait for cooldown from last action
                     if now - last_action < cooldown:
+                        self.escalation_state[drone_id] = state
                         return
 
                     # Execute escalation
                     success = self._execute_escalation(node, current_level + 1, status)
 
-                    state['level'] = current_level + 1
                     state['last_action'] = now
                     state['attempts'] = state.get('attempts', 0) + 1
+                    # Only advance to next level if current action executed.
+                    if success:
+                        state['level'] = current_level + 1
+                        state['consecutive_failures'] = 0
                     self.escalation_state[drone_id] = state
 
     def _execute_escalation(self, node: dict, level: int, reason: str) -> bool:
