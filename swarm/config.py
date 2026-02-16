@@ -43,6 +43,15 @@ QUEUE_TARGET = int(os.environ.get('QUEUE_TARGET', 5))
 CORES_PER_SLOT = int(os.environ.get('CORES_PER_SLOT', 4))
 NODE_TIMEOUT = int(os.environ.get('NODE_TIMEOUT', 60))
 STALE_TIMEOUT = int(os.environ.get('STALE_TIMEOUT', 300))
+ASSIGNMENT_LEASE_SECONDS = int(os.environ.get('ASSIGNMENT_LEASE_SECONDS', 120))
+# Conservative reclaim defaults to avoid queue churn on healthy drones.
+RECLAIM_OFFLINE_TIMEOUT_MINUTES = int(os.environ.get('RECLAIM_OFFLINE_TIMEOUT_MINUTES', 15))
+RECLAIM_LEASE_SECONDS = int(os.environ.get('RECLAIM_LEASE_SECONDS', 600))
+
+# Self-healing defaults: avoid aggressive actions on transient probe failures.
+SELF_HEAL_PROBE_INTERVAL_SECONDS = int(os.environ.get('SELF_HEAL_PROBE_INTERVAL_SECONDS', 30))
+SELF_HEAL_MIN_CONSECUTIVE_FAILURES = int(os.environ.get('SELF_HEAL_MIN_CONSECUTIVE_FAILURES', 3))
+SELF_HEAL_MIN_FAILURE_WINDOW_SECONDS = int(os.environ.get('SELF_HEAL_MIN_FAILURE_WINDOW_SECONDS', 180))
 
 # Sweeper configuration
 SWEEPER_PREFIX = os.environ.get('SWEEPER_PREFIX', 'sweeper-')

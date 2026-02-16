@@ -310,7 +310,7 @@ class Scheduler:
 
         return stolen
 
-    def reclaim_offline_work(self, timeout_minutes: int = 5):
+    def reclaim_offline_work(self, timeout_minutes: int = None):
         """Reclaim work from offline or truly stale drones.
 
         Reliability rules:
@@ -319,6 +319,7 @@ class Scheduler:
         - Do NOT reclaim active long builds (building_since/current_task present).
         - Optionally reclaim not-started delegated work after timeout.
         """
+        timeout_minutes = timeout_minutes or cfg.RECLAIM_OFFLINE_TIMEOUT_MINUTES
         cutoff = time.time() - (timeout_minutes * 60)
         delegated = self.db.get_delegated_packages()
         reclaimed = 0
@@ -358,8 +359,9 @@ class Scheduler:
             log.info(f"[RECLAIM] Total {reclaimed} packages reclaimed")
         return reclaimed
 
-    def reclaim_expired_leases(self, lease_seconds: int = 120) -> int:
+    def reclaim_expired_leases(self, lease_seconds: int = None) -> int:
         """Reclaim delegated packages from drones that stopped heartbeating."""
+        lease_seconds = lease_seconds or cfg.RECLAIM_LEASE_SECONDS
         now = time.time()
         delegated = self.db.get_delegated_packages()
         reclaimed = 0

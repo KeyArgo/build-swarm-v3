@@ -18,6 +18,7 @@ import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
+from . import config as cfg
 from .events import add_event
 
 log = logging.getLogger('swarm-v3')
@@ -122,7 +123,7 @@ class SelfHealingMonitor:
         self.escalation_state: Dict[str, dict] = {}  # drone_id -> state
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._probe_interval = 30  # seconds between probes
+        self._probe_interval = cfg.SELF_HEAL_PROBE_INTERVAL_SECONDS
         self._lock = threading.Lock()
 
     def start(self):
@@ -303,6 +304,7 @@ class SelfHealingMonitor:
                 'last_action': 0,
                 'attempts': 0,
                 'consecutive_failures': 0,
+                'first_failure_at': 0,
             })
 
             current_level = state['level']
@@ -312,6 +314,7 @@ class SelfHealingMonitor:
             # Treat disk warning as non-escalating telemetry.
             if status == 'disk_warning':
                 state['consecutive_failures'] = 0
+                state['first_failure_at'] = 0
                 self.escalation_state[drone_id] = state
                 add_event('warn', f"{drone_name} disk usage warning",
                           {'drone': drone_name, 'status': status})
@@ -324,15 +327,25 @@ class SelfHealingMonitor:
             fresh_heartbeat = bool(node_last_seen and (time.time() - node_last_seen) < 120)
             if status in ('unreachable', 'timeout') and fresh_heartbeat:
                 state['consecutive_failures'] = 0
+                state['first_failure_at'] = 0
                 self.escalation_state[drone_id] = state
                 add_event('warn', f"{drone_name} probe unreachable but heartbeat is fresh",
                           {'drone': drone_name, 'status': status})
                 return
 
+            if not state.get('first_failure_at'):
+                state['first_failure_at'] = now
             state['consecutive_failures'] = state.get('consecutive_failures', 0) + 1
-            # Require two consecutive failed probes before escalating to reduce
+            # Require consecutive failed probes before escalating to reduce
             # false positives from transient SSH/network blips.
-            if state['consecutive_failures'] < 2:
+            min_failures = max(1, cfg.SELF_HEAL_MIN_CONSECUTIVE_FAILURES)
+            if state['consecutive_failures'] < min_failures:
+                self.escalation_state[drone_id] = state
+                return
+
+            # Require failures to persist for a minimum wall-clock window.
+            min_window = max(0, cfg.SELF_HEAL_MIN_FAILURE_WINDOW_SECONDS)
+            if min_window > 0 and (now - state['first_failure_at']) < min_window:
                 self.escalation_state[drone_id] = state
                 return
 
@@ -356,6 +369,7 @@ class SelfHealingMonitor:
                     if success:
                         state['level'] = current_level + 1
                         state['consecutive_failures'] = 0
+                        state['first_failure_at'] = 0
                     self.escalation_state[drone_id] = state
 
     def _execute_escalation(self, node: dict, level: int, reason: str) -> bool:

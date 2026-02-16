@@ -12,6 +12,7 @@ import socket
 import subprocess
 import threading
 import time
+import uuid
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from typing import Any, Optional
 from urllib.parse import urlparse, parse_qs
@@ -177,7 +178,7 @@ class V3Handler(BaseHTTPRequestHandler):
 
         if path in ADMIN_ONLY_GET:
             admin_key = self.headers.get('X-Admin-Key', '')
-            if admin_key != cfg.ADMIN_KEY:
+            if admin_key != cfg.ADMIN_SECRET:
                 self.send_json({
                     'error': 'Admin authentication required',
                     'hint': 'Use admin dashboard for this endpoint'
@@ -260,6 +261,34 @@ class V3Handler(BaseHTTPRequestHandler):
             result = scheduler.get_work(drone_id, self.client_address[0])
 
             # v3.1: Include revoke list for packages rebalanced away from this drone
+            revoked = scheduler.get_stale_assignments(drone_id)
+
+            if isinstance(result, dict) and result.get('action'):
+                if revoked:
+                    result['revoke'] = revoked
+                self.send_json(result)
+            elif result:
+                resp = {'package': result}
+                if revoked:
+                    resp['revoke'] = revoked
+                self.send_json(resp)
+            else:
+                resp = {'package': None}
+                if revoked:
+                    resp['revoke'] = revoked
+                self.send_json(resp)
+
+        # ── Poll (v4 agent compat: alias for /api/v1/work) ──
+        elif path == '/api/v1/poll':
+            node_name = params.get('node', [None])[0]
+            drone_id = params.get('id', [None])[0]
+            if node_name and not drone_id:
+                drone_id = db.resolve_drone_id(node_name)
+            if not drone_id:
+                self.send_json({'package': None, 'error': 'Unknown node'}, 404)
+                return
+
+            result = scheduler.get_work(drone_id, self.client_address[0])
             revoked = scheduler.get_stale_assignments(drone_id)
 
             if isinstance(result, dict) and result.get('action'):
@@ -775,7 +804,7 @@ class V3Handler(BaseHTTPRequestHandler):
 
         if path in ADMIN_ONLY_ENDPOINTS or any(path.startswith(p) for p in ADMIN_ONLY_PREFIXES):
             admin_key = self.headers.get('X-Admin-Key', '')
-            if admin_key != cfg.ADMIN_KEY:
+            if admin_key != cfg.ADMIN_SECRET:
                 self.send_json({
                     'error': 'Admin authentication required',
                     'hint': 'This endpoint requires X-Admin-Key header on public port. Use admin dashboard instead.'
@@ -785,9 +814,14 @@ class V3Handler(BaseHTTPRequestHandler):
         # ── Node Registration (was Gateway /register) ──
         if path == '/api/v1/register':
             node_id = data.get('id')
+            # v4-style agents send 'node_name' instead of 'id' — generate a
+            # deterministic UUID so the same name always maps to the same ID.
             if not node_id:
-                self.send_json({'error': 'Missing node ID'}, 400)
-                return
+                node_name_raw = data.get('node_name') or data.get('name')
+                if not node_name_raw:
+                    self.send_json({'error': 'Missing node ID'}, 400)
+                    return
+                node_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, node_name_raw))
 
             node_type = data.get('type', 'drone')
             # v3 doesn't have separate orchestrators — skip orchestrator registration
@@ -795,7 +829,7 @@ class V3Handler(BaseHTTPRequestHandler):
                 self.send_json({'status': 'ignored', 'message': 'v3 does not track orchestrators'})
                 return
 
-            name = data.get('name', f'unknown-{node_id[:8]}')
+            name = data.get('name') or data.get('node_name', f'unknown-{node_id[:8]}')
             ip = data.get('ip') or self.client_address[0]
             caps = data.get('capabilities', {})
             metrics = data.get('metrics', {})
@@ -837,6 +871,30 @@ class V3Handler(BaseHTTPRequestHandler):
                 'orchestrator_port': cfg.CONTROL_PLANE_PORT,
                 'orchestrator_name': 'build-swarm-v3',
             }
+            revoked = scheduler.get_stale_assignments(node_id)
+            if revoked:
+                resp['revoke'] = revoked
+
+            if current_task and not db.is_package_assigned_to(current_task, node_id):
+                owner = db.fetchone(
+                    "SELECT status, assigned_to FROM queue WHERE package = ? LIMIT 1",
+                    (current_task,))
+                stop_reason = 'work was reclaimed'
+                reassigned_to = None
+                if owner and owner['status'] == 'delegated' and owner['assigned_to']:
+                    reassigned_to = db.get_drone_name(owner['assigned_to'])
+                    stop_reason = f'work reassigned to {reassigned_to}'
+                elif owner and owner['status'] == 'received':
+                    stop_reason = 'work already completed elsewhere'
+                resp['stop_work'] = {
+                    'package': current_task,
+                    'reason': stop_reason,
+                    'reassigned_to': reassigned_to,
+                }
+                add_event('stale',
+                          f"{name} instructed to stop stale work {current_task} ({stop_reason})",
+                          {'drone': name, 'package': current_task,
+                           'reason': stop_reason, 'reassigned_to': reassigned_to})
             if node and node.get('paused'):
                 resp['paused'] = True
 
@@ -854,75 +912,31 @@ class V3Handler(BaseHTTPRequestHandler):
                 self.send_json({'error': 'Missing package'}, 400)
                 return
 
-            drone_name = db.get_drone_name(drone_id)
+            result = self._handle_build_completion(
+                drone_id, package, status, duration, error_detail)
+            self.send_json(result)
 
-            # v3.1: Check if this is a stale completion from a rebalanced package
-            is_valid = scheduler.is_valid_assignment(drone_id, package)
-
-            if not is_valid and status != 'success':
-                # DISCARD stale failures — don't poison circuit breaker or failure counts
-                log.info(f"[STALE-FAIL] {package} from {drone_name} — ignoring (no longer assigned)")
-                add_event('stale', f"{package} stale failure from {drone_name} (discarded)",
-                          {'package': package, 'drone': drone_name, 'status': status})
-                self.send_json({'status': 'ok', 'accepted': False, 'stale': True})
+        # ── Report (v4 agent compat: alias for /api/v1/complete) ──
+        elif path == '/api/v1/report':
+            node_name = data.get('node') or data.get('name')
+            drone_id = data.get('id')
+            if node_name and not drone_id:
+                drone_id = db.resolve_drone_id(node_name)
+            if not drone_id:
+                self.send_json({'error': 'Unknown node'}, 404)
                 return
 
-            if not is_valid and status == 'success':
-                # Accept free work but log warning
-                log.info(f"[STALE-OK] {package} from {drone_name} — accepting (free work)")
+            package = data.get('package')
+            status = data.get('status', 'unknown')
+            duration = data.get('build_duration_s', data.get('duration', 0))
+            error_detail = data.get('error_detail', data.get('error', ''))
+            if not package:
+                self.send_json({'error': 'Missing package'}, 400)
+                return
 
-            # Handle success with validation
-            if status == 'success':
-                if not _is_virtual_package(package) and 'app-test/dummy-' not in package:
-                    validated = _validate_binary(package)
-                    if not validated:
-                        status = 'missing_binary'
-
-            # Record in DB
-            db.complete_package(package, drone_id, status,
-                               duration_seconds=duration,
-                               error_message=error_detail)
-
-            if status == 'success':
-                health_monitor.record_success(drone_id)
-                health_monitor.reset_upload_failures(drone_id)
-                dur_str = f" in {duration:.1f}s" if duration > 0 else ""
-                log.info(f"[RECV] {package} <- {drone_name}{dur_str}")
-                add_event('complete', f"{package} completed on {drone_name}{dur_str}",
-                          {'package': package, 'drone': drone_name, 'duration': duration})
-            elif status == 'returned':
-                log.info(f"[RETURNED] {package} by {drone_name} ({error_detail or 'unspecified'})")
-                add_event('return', f"{package} returned by {drone_name}",
-                          {'package': package, 'drone': drone_name, 'reason': error_detail})
-            elif status == 'upload_failed':
-                health_monitor.record_upload_failure(drone_id)
-            else:
-                health_monitor.record_failure(drone_id)
-                log.warning(f"[FAIL] {package} on {drone_name} ({status})")
-                if error_detail:
-                    log.warning(f"[FAIL] Detail: {error_detail[:200]}")
-                add_event('fail', f"{package} failed on {drone_name}: {status}",
-                          {'package': package, 'drone': drone_name, 'status': status,
-                           'error': error_detail[:200] if error_detail else ''})
-
-                # v3.1: Cross-drone failure detection — if 2+ drones fail this package,
-                # block it immediately (it's a package problem, not a drone problem)
-                distinct_failures = db.count_distinct_drone_failures(package)
-                if distinct_failures >= 2:
-                    # Check if already blocked
-                    q = db.fetchone(
-                        "SELECT status FROM queue WHERE package = ? AND status != 'received'",
-                        (package,))
-                    if q and q['status'] not in ('blocked', 'received'):
-                        db.execute("""
-                            UPDATE queue SET status = 'blocked', error_message = ?
-                            WHERE package = ? AND status IN ('needed', 'delegated')
-                        """, (f"Failed on {distinct_failures} different drones", package))
-                        log.warning(f"[CROSS-FAIL] {package} blocked — failed on {distinct_failures} drones")
-                        add_event('fail', f"{package} blocked (failed on {distinct_failures} drones)",
-                                  {'package': package, 'distinct_drones': distinct_failures})
-
-            self.send_json({'status': 'ok', 'accepted': status == 'success'})
+            result = self._handle_build_completion(
+                drone_id, package, status, duration, error_detail)
+            self.send_json(result)
 
         # ── Queue Packages (was Orchestrator /queue) ──
         elif path == '/api/v1/queue':
@@ -1102,6 +1116,94 @@ class V3Handler(BaseHTTPRequestHandler):
         else:
             self.send_json({'error': 'Not found'}, 404)
 
+    def _handle_build_completion(self, drone_id: str, package: str,
+                                 status: str, duration: float,
+                                 error_detail: str) -> dict:
+        drone_name = db.get_drone_name(drone_id)
+        is_valid = scheduler.is_valid_assignment(drone_id, package)
+
+        if not is_valid:
+            owner = db.fetchone(
+                "SELECT status, assigned_to FROM queue WHERE package = ? LIMIT 1",
+                (package,))
+            reason = 'work reclaimed'
+            reassigned_to = None
+            if owner and owner['status'] == 'delegated' and owner['assigned_to']:
+                reassigned_to = db.get_drone_name(owner['assigned_to'])
+                reason = f'work reassigned to {reassigned_to}'
+            elif owner and owner['status'] == 'received':
+                reason = 'work already completed'
+
+            log.info(f"[STALE-REPORT] {package} from {drone_name} ignored ({reason})")
+            add_event('stale', f"{package} stale report from {drone_name} (ignored: {reason})",
+                      {'package': package, 'drone': drone_name, 'status': status,
+                       'reason': reason, 'reassigned_to': reassigned_to})
+            return {
+                'status': 'ok',
+                'accepted': False,
+                'stale': True,
+                'action': 'stop_work',
+                'reason': reason,
+                'reassigned_to': reassigned_to,
+            }
+
+        if status == 'success':
+            if not _is_virtual_package(package) and 'app-test/dummy-' not in package:
+                validated = _validate_binary(package)
+                if not validated:
+                    status = 'missing_binary'
+
+        db.complete_package(package, drone_id, status,
+                            duration_seconds=duration,
+                            error_message=error_detail)
+
+        if status == 'success':
+            health_monitor.record_success(drone_id)
+            health_monitor.reset_upload_failures(drone_id)
+            dur_str = f" in {duration:.1f}s" if duration > 0 else ""
+            log.info(f"[RECV] {package} <- {drone_name}{dur_str}")
+            add_event('complete', f"{package} completed on {drone_name}{dur_str}",
+                      {'package': package, 'drone': drone_name, 'duration': duration})
+        elif status == 'returned':
+            log.info(f"[RETURNED] {package} by {drone_name} ({error_detail or 'unspecified'})")
+            add_event('return', f"{package} returned by {drone_name}",
+                      {'package': package, 'drone': drone_name, 'reason': error_detail})
+        elif status == 'upload_failed':
+            health_monitor.record_upload_failure(drone_id)
+        else:
+            health_monitor.record_failure(drone_id)
+            log.warning(f"[FAIL] {package} on {drone_name} ({status})")
+            if error_detail:
+                log.warning(f"[FAIL] Detail: {error_detail[:200]}")
+            add_event('fail', f"{package} failed on {drone_name}: {status}",
+                      {'package': package, 'drone': drone_name, 'status': status,
+                       'error': error_detail[:200] if error_detail else ''})
+
+            if status == 'masked':
+                db.execute("""
+                    UPDATE queue SET status = 'blocked', error_message = 'Package masked upstream'
+                    WHERE package = ? AND status IN ('needed', 'delegated')
+                """, (package,))
+                log.warning(f"[MASKED] {package} blocked — masked by upstream")
+                add_event('blocked', f"{package} blocked (masked upstream)",
+                          {'package': package, 'reason': 'masked'})
+
+            distinct_failures = db.count_distinct_drone_failures(package)
+            if distinct_failures >= 2:
+                q = db.fetchone(
+                    "SELECT status FROM queue WHERE package = ? AND status != 'received'",
+                    (package,))
+                if q and q['status'] not in ('blocked', 'received'):
+                    db.execute("""
+                        UPDATE queue SET status = 'blocked', error_message = ?
+                        WHERE package = ? AND status IN ('needed', 'delegated')
+                    """, (f"Failed on {distinct_failures} different drones", package))
+                    log.warning(f"[CROSS-FAIL] {package} blocked — failed on {distinct_failures} drones")
+                    add_event('fail', f"{package} blocked (failed on {distinct_failures} drones)",
+                              {'package': package, 'distinct_drones': distinct_failures})
+
+        return {'status': 'ok', 'accepted': status == 'success'}
+
     def _handle_control(self, action: str, data: dict):
         """Handle control actions (pause/resume/unblock/reset/etc)."""
         if action == 'pause':
@@ -1188,6 +1290,18 @@ class V3Handler(BaseHTTPRequestHandler):
             count = db.unblock_all()
             log.info(f"Retrying {count} failed packages")
             self.send_json({'status': 'ok', 'requeued': count})
+
+        elif action == 'clear_history':
+            # Clear per-drone failure tracking from build_history
+            # This allows packages to be retried on drones that previously failed them
+            count = db.fetchval(
+                "SELECT COUNT(*) FROM build_history WHERE status NOT IN ('success', 'returned', 'upload_failed')"
+            ) or 0
+            db.execute(
+                "DELETE FROM build_history WHERE status NOT IN ('success', 'returned', 'upload_failed')"
+            )
+            log.info(f"Cleared {count} failure records from build history")
+            self.send_json({'status': 'ok', 'cleared': count})
 
         else:
             self.send_json({'error': f'Unknown action: {action}'}, 400)
@@ -1630,7 +1744,8 @@ def _maintenance_loop():
         time.sleep(15)
         try:
             db.update_node_status(cfg.NODE_TIMEOUT, cfg.STALE_TIMEOUT)
-            scheduler.reclaim_offline_work()
+            scheduler.reclaim_expired_leases(cfg.RECLAIM_LEASE_SECONDS)
+            scheduler.reclaim_offline_work(cfg.RECLAIM_OFFLINE_TIMEOUT_MINUTES)
             scheduler.auto_age_blocked()
 
             # Check for stale builds every 4th cycle (~60s)
