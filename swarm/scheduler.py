@@ -124,6 +124,7 @@ class Scheduler:
             queue_target = max(1, cores // cfg.CORES_PER_SLOT)
         else:
             queue_target = cfg.QUEUE_TARGET
+        queue_target = min(queue_target, max(1, cfg.MAX_PREFETCH_PER_DRONE))
 
         # Get needed packages (fetch extra to have alternatives if some are skipped)
         needed = self.db.get_needed_packages(limit=queue_target * 3)
@@ -194,6 +195,7 @@ class Scheduler:
         if drone_cfg and drone_cfg.get('cores_limit'):
             cores = min(cores, drone_cfg['cores_limit'])
         queue_target = max(1, cores // cfg.CORES_PER_SLOT) if cores > 0 else cfg.QUEUE_TARGET
+        queue_target = min(queue_target, max(1, cfg.MAX_PREFETCH_PER_DRONE))
 
         for pkg_row in blocked:
             if assigned_count >= queue_target:

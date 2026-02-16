@@ -37,6 +37,7 @@ Implemented in `swarm/config.py`:
 - `SELF_HEAL_PROBE_INTERVAL_SECONDS=30`
 - `SELF_HEAL_MIN_CONSECUTIVE_FAILURES=3`
 - `SELF_HEAL_MIN_FAILURE_WINDOW_SECONDS=180`
+- `MAX_PREFETCH_PER_DRONE=2`
 
 ## New Runtime Controls
 Set in environment or `/etc/build-swarm/swarm.conf`:
@@ -60,6 +61,11 @@ Set in environment or `/etc/build-swarm/swarm.conf`:
 - `SELF_HEAL_MIN_FAILURE_WINDOW_SECONDS`
   - Minimum failure duration before escalation.
   - Default: `180`
+
+- `MAX_PREFETCH_PER_DRONE`
+  - Maximum delegated queue depth held by a single drone.
+  - Limits over-delegation and reduces assignment churn.
+  - Default: `2`
 
 ## Fedora/Debian Quality Bar (Target SLOs)
 
