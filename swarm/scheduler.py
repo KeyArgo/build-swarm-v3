@@ -337,16 +337,13 @@ class Scheduler:
                 last_seen = node.get('last_seen') or 0
                 heartbeat_stale = bool(last_seen and last_seen < cutoff)
 
-                # Never reclaim if the drone is actively building and heartbeating.
-                actively_building = bool(pkg.get('building_since')) or bool(node.get('current_task'))
-
+                # Online drones keep their queue; reclaim only when heartbeat
+                # itself is stale. This avoids churn on long dependency chains
+                # where assigned packages may sit for minutes before emerge
+                # starts them.
                 if heartbeat_stale:
                     should_reclaim = True
                     reason = f"heartbeat stale (>{timeout_minutes}m)"
-                elif (not actively_building and
-                      pkg.get('assigned_at') and pkg['assigned_at'] < cutoff):
-                    should_reclaim = True
-                    reason = f"not-started timeout (>{timeout_minutes}m)"
 
             if should_reclaim:
                 drone_name = self.db.get_drone_name(drone_id)

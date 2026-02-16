@@ -317,6 +317,18 @@ class SelfHealingMonitor:
                           {'drone': drone_name, 'status': status})
                 return
 
+            # If control plane heartbeats are fresh, SSH probe failure alone is
+            # not enough to trigger recovery actions. This prevents false
+            # escalation when SSH routing/firewall differs from API path.
+            node_last_seen = node.get('last_seen') or 0
+            fresh_heartbeat = bool(node_last_seen and (time.time() - node_last_seen) < 120)
+            if status in ('unreachable', 'timeout') and fresh_heartbeat:
+                state['consecutive_failures'] = 0
+                self.escalation_state[drone_id] = state
+                add_event('warn', f"{drone_name} probe unreachable but heartbeat is fresh",
+                          {'drone': drone_name, 'status': status})
+                return
+
             state['consecutive_failures'] = state.get('consecutive_failures', 0) + 1
             # Require two consecutive failed probes before escalating to reduce
             # false positives from transient SSH/network blips.
