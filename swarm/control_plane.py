@@ -1746,6 +1746,7 @@ def _maintenance_loop():
             db.update_node_status(cfg.NODE_TIMEOUT, cfg.STALE_TIMEOUT)
             scheduler.reclaim_expired_leases(cfg.RECLAIM_LEASE_SECONDS)
             scheduler.reclaim_offline_work(cfg.RECLAIM_OFFLINE_TIMEOUT_MINUTES)
+            scheduler.enforce_prefetch_cap(cfg.MAX_PREFETCH_PER_DRONE)
             scheduler.auto_age_blocked()
 
             # Check for stale builds every 4th cycle (~60s)

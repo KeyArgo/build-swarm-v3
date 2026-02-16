@@ -406,6 +406,56 @@ class Scheduler:
             log.info(f"[LEASE-RECLAIM] reclaimed {reclaimed} packages")
         return reclaimed
 
+    def enforce_prefetch_cap(self, max_prefetch: int = None) -> int:
+        """Trim over-delegated queues back to per-drone prefetch cap.
+
+        Keeps oldest assignments and returns newer queued (not active) work
+        to `needed` so other drones can claim it.
+        """
+        cap = max_prefetch or cfg.MAX_PREFETCH_PER_DRONE
+        cap = max(1, cap)
+        reclaimed = 0
+
+        delegated = self.db.get_delegated_packages()
+        by_drone = {}
+        for pkg in delegated:
+            did = pkg.get('assigned_to')
+            if not did:
+                continue
+            by_drone.setdefault(did, []).append(pkg)
+
+        now = time.time()
+        for drone_id, pkgs in by_drone.items():
+            if len(pkgs) <= cap:
+                continue
+
+            node = self.db.get_node(drone_id) or {}
+            current_task = node.get('current_task')
+            drone_name = self.db.get_drone_name(drone_id)
+
+            # Keep oldest first to preserve established execution order.
+            pkgs_sorted = sorted(pkgs, key=lambda p: p.get('assigned_at') or 0)
+            keep = 0
+            for pkg in pkgs_sorted:
+                package = pkg['package']
+                is_active = bool(pkg.get('building_since')) or (current_task == package)
+                if keep < cap or is_active:
+                    keep += 1
+                    continue
+
+                if self.db.reclaim_package(package):
+                    self._mark_revoked(drone_id, package)
+                    reclaimed += 1
+                    age = int(now - (pkg.get('assigned_at') or now))
+                    log.info(f"[PREFETCH-CAP] reclaimed {package} from {drone_name} (age={age}s)")
+                    add_event('rebalance',
+                              f"{package} reclaimed from {drone_name} (prefetch cap)",
+                              {'package': package, 'drone': drone_name, 'age_s': age, 'cap': cap})
+
+        if reclaimed:
+            log.info(f"[PREFETCH-CAP] reclaimed {reclaimed} over-delegated packages")
+        return reclaimed
+
     def auto_age_blocked(self):
         """Unblock packages that have been blocked longer than FAILURE_AGE_MINUTES."""
         cutoff = time.time() - (cfg.FAILURE_AGE_MINUTES * 60)
